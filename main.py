@@ -3,7 +3,8 @@
 Telegram signal bot with all-market scanning and manual selection.
 Requires: python-telegram-bot and pyquotex.
 """
-
+from dotenv import load_dotenv
+load_dotenv()
 import asyncio
 import logging
 import os
