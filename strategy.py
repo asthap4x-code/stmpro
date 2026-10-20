@@ -1,603 +1,557 @@
 
-"""
-STM Pro Bot — strategy.py
+# strategy.py
+# STM Pro Bot — Seven Rule-Based Strategies
+# Signal analysis only. No automatic trading.
 
-Includes:
-1. Original trend, swing, support/resistance, engulfing,
-   wick-rejection and momentum strategy.
-2. New 3-4 candle continuation setup.
-3. Candle quality filters for doji, weak bodies,
-   excessive wicks, unusually large candles and volatility.
-
-Note:
-No strategy guarantees a particular win rate.
-"""
-
-from statistics import median
+import math
+import numpy as np
+import pandas as pd
 
 
-# =========================================================
-# CANDLE HELPERS
-# =========================================================
-
-def number(candle, *keys):
-    """Read a numeric value from common candle field names."""
-    if not isinstance(candle, dict):
-        return None
-
-    for key in keys:
-        try:
-            value = candle.get(key)
-
-            if value is not None:
-                return float(value)
-
-        except (AttributeError, TypeError, ValueError):
-            pass
-
-    return None
+MIN_CANDLES = 220
+MIN_PAYOUT_PERCENT = 80.0
+DOJI_BODY_RATIO = 0.10
+LARGE_WICK_RATIO = 0.60
 
 
 def normalize_candle(candle):
-    """Convert common Quotex candle formats to one standard format."""
-    if not isinstance(candle, dict):
+    """Normalize common PyQuotex OHLC candle dictionaries."""
+    try:
+        if not isinstance(candle, dict):
+            return None
+
+        ts = candle.get("timestamp", candle.get("time", candle.get("from")))
+        o = candle.get("open", candle.get("Open"))
+        h = candle.get("high", candle.get("max", candle.get("High")))
+        l = candle.get("low", candle.get("min", candle.get("Low")))
+        c = candle.get("close", candle.get("Close"))
+
+        if None in (ts, o, h, l, c):
+            return None
+
+        ts = int(float(ts))
+        o, h, l, c = map(float, (o, h, l, c))
+
+        if not all(math.isfinite(v) for v in (o, h, l, c)):
+            return None
+        if min(o, h, l, c) <= 0:
+            return None
+        if h < max(o, c, l) or l > min(o, c, h):
+            return None
+
+        return {
+            "timestamp": ts,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+        }
+    except (TypeError, ValueError, OverflowError):
         return None
-
-    timestamp = number(
-        candle, "time", "timestamp", "at", "from"
-    )
-    open_price = number(candle, "open", "Open")
-    high = number(candle, "high", "max", "High")
-    low = number(candle, "low", "min", "Low")
-    close = number(candle, "close", "Close")
-
-    if None in (
-        timestamp,
-        open_price,
-        high,
-        low,
-        close,
-    ):
-        return None
-
-    # Convert millisecond timestamps to seconds.
-    if timestamp > 10_000_000_000:
-        timestamp /= 1000
-
-    if high < low:
-        return None
-
-    if high < max(open_price, close):
-        return None
-
-    if low > min(open_price, close):
-        return None
-
-    return {
-        "time": int(timestamp),
-        "open": open_price,
-        "high": high,
-        "low": low,
-        "close": close,
-    }
 
 
 def candle_color(candle):
-    """Return GREEN, RED or DOJI."""
-    if candle["close"] > candle["open"]:
+    c = normalize_candle(candle)
+    if not c:
+        return "DOJI"
+    if c["close"] > c["open"]:
         return "GREEN"
-
-    if candle["close"] < candle["open"]:
+    if c["close"] < c["open"]:
         return "RED"
-
     return "DOJI"
 
 
-def candle_body(candle):
-    return abs(candle["close"] - candle["open"])
+def _make_frame(candles):
+    rows = [normalize_candle(c) for c in candles]
+    rows = [c for c in rows if c is not None]
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["timestamp", "open", "high", "low", "close"]
+        )
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates("timestamp", keep="last")
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 
-def candle_range(candle):
-    return max(candle["high"] - candle["low"], 0.0)
+def _indicators(df):
+    d = df.copy()
+    o, h, l, c = d["open"], d["high"], d["low"], d["close"]
 
+    d["ema20"] = c.ewm(span=20, adjust=False).mean()
+    d["ema50"] = c.ewm(span=50, adjust=False).mean()
+    d["ema100"] = c.ewm(span=100, adjust=False).mean()
+    d["ema200"] = c.ewm(span=200, adjust=False).mean()
 
-def upper_wick(candle):
-    return candle["high"] - max(
-        candle["open"], candle["close"]
+    previous_close = c.shift(1)
+    tr = pd.concat(
+        [h - l, (h - previous_close).abs(), (l - previous_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    d["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    d["atr_median50"] = d["atr"].rolling(50).median()
+
+    up_move = h.diff()
+    down_move = -l.diff()
+    plus_dm = up_move.where(
+        (up_move > down_move) & (up_move > 0), 0.0
+    )
+    minus_dm = down_move.where(
+        (down_move > up_move) & (down_move > 0), 0.0
     )
 
+    atr_safe = d["atr"].replace(0, np.nan)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe
+    minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe
+    dx = (
+        100 * (plus_di - minus_di).abs()
+        / (plus_di + minus_di).replace(0, np.nan)
+    )
+    d["adx"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
 
-def lower_wick(candle):
-    return min(
-        candle["open"], candle["close"]
-    ) - candle["low"]
+    delta = c.diff()
+    gains = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    losses = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gains / losses.replace(0, np.nan)
+    d["rsi"] = 100 - 100 / (1 + rs)
 
-
-def result(
-    direction,
-    score,
-    support,
-    resistance,
-    candle,
-    reasons,
-    strategy_name,
-):
-    """Keep a consistent result format for main.py."""
-    return {
-        "direction": direction,
-        "score": round(float(score), 2),
-        "confidence": min(
-            82,
-            int(55 + abs(float(score)) * 7),
-        ),
-        "support": support,
-        "resistance": resistance,
-        "candle": candle,
-        "reasons": reasons,
-        "strategy": strategy_name,
-    }
-
-
-# =========================================================
-# QUALITY FILTERS
-# =========================================================
-
-def candle_is_good(candle, recent_candles):
-    """
-    Reject candles with:
-    - Tiny bodies / doji-like candles
-    - Excessive wick rejection
-    - Unusually large ranges
-    """
-    body = candle_body(candle)
-    total_range = candle_range(candle)
-
-    if total_range <= 0:
-        return False, "Zero-range candle"
-
-    # Require a meaningful body.
-    body_ratio = body / total_range
-
-    if body_ratio < 0.35:
-        return False, "Weak body or doji-like candle"
-
-    # Reject candles dominated by long wicks.
-    upper_ratio = upper_wick(candle) / total_range
-    lower_ratio = lower_wick(candle) / total_range
-
-    if max(upper_ratio, lower_ratio) > 0.45:
-        return False, "Excessive candle wick"
-
-    # Reject a candle much larger than typical recent candles.
-    ranges = [
-        candle_range(item)
-        for item in recent_candles
-        if candle_range(item) > 0
-    ]
-
-    if len(ranges) >= 5:
-        typical_range = median(ranges)
-
-        if typical_range > 0 and total_range > typical_range * 2.2:
-            return False, "Unusually large candle"
-
-    return True, "Candle quality passed"
-
-
-def volatility_is_acceptable(candles):
-    """
-    Reject extreme volatility where recent ranges expand sharply.
-    This is a simple heuristic, not a statistical volatility model.
-    """
-    recent = candles[-10:]
-
-    ranges = [
-        candle_range(candle)
-        for candle in recent
-        if candle_range(candle) > 0
-    ]
-
-    if len(ranges) < 7:
-        return False, "Not enough valid ranges"
-
-    typical_range = median(ranges)
-
-    if typical_range <= 0:
-        return False, "Invalid typical range"
-
-    latest_range = candle_range(recent[-1])
-
-    if latest_range > typical_range * 2.2:
-        return False, "Latest candle volatility is too high"
-
-    # Reject a cluster of persistently oversized candles.
-    oversized = sum(
-        1 for value in ranges
-        if value > typical_range * 1.8
+    d["bb_mid"] = c.rolling(20).mean()
+    sd = c.rolling(20).std(ddof=0)
+    d["bb_upper"] = d["bb_mid"] + 2 * sd
+    d["bb_lower"] = d["bb_mid"] - 2 * sd
+    d["bb_width"] = (
+        (d["bb_upper"] - d["bb_lower"])
+        / d["bb_mid"].replace(0, np.nan)
     )
 
-    if oversized >= 4:
-        return False, "Recent volatility is elevated"
+    macd_fast = c.ewm(span=12, adjust=False).mean()
+    macd_slow = c.ewm(span=26, adjust=False).mean()
+    d["macd"] = macd_fast - macd_slow
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
 
-    return True, "Volatility filter passed"
-
-
-# =========================================================
-# NEW: 3-4 CANDLE CONTINUATION STRATEGY
-# =========================================================
-
-def continuation_strategy(candles):
-    """
-    Setup A:
-        Downtrend + 3-4 RED candles + final GREEN candle
-        => PUT candidate.
-
-    Setup B:
-        Uptrend + 3-4 GREEN candles + final RED candle
-        => CALL candidate.
-
-    All candles must pass the quality checks.
-    The latest candle is assumed to be closed by the caller.
-    """
-    if len(candles) < 25:
-        return None
-
-    recent = candles[-25:]
-    latest = recent[-1]
-
-    # Ensure the latest candle has a clear direction.
-    latest_color = candle_color(latest)
-
-    if latest_color == "DOJI":
-        return None
-
-    # Filter the latest candle and the recent volatility.
-    quality_ok, _ = candle_is_good(
-        latest,
-        recent[-10:],
+    lowest = l.rolling(14).min()
+    highest = h.rolling(14).max()
+    d["stoch_k"] = (
+        100 * (c - lowest) / (highest - lowest).replace(0, np.nan)
     )
+    d["stoch_d"] = d["stoch_k"].rolling(3).mean()
 
-    if not quality_ok:
-        return None
+    d["body"] = (c - o).abs()
+    d["range"] = (h - l).replace(0, np.nan)
+    d["body_ratio"] = d["body"] / d["range"]
+    d["upper_wick"] = (
+        h - pd.concat([o, c], axis=1).max(axis=1)
+    ) / d["range"]
+    d["lower_wick"] = (
+        pd.concat([o, c], axis=1).min(axis=1) - l
+    ) / d["range"]
 
-    volatility_ok, _ = volatility_is_acceptable(recent)
+    return d
 
-    if not volatility_ok:
-        return None
 
-    closes = [item["close"] for item in recent]
+def market_filter(candles, payout_percent, candle_seconds=60):
+    """
+    Common filter for every strategy.
+    Input must contain closed candles only.
+    """
+    if payout_percent is None:
+        return False, "Live payout unavailable"
 
-    fast_ma = sum(closes[-5:]) / 5
-    slow_ma = sum(closes[-15:]) / 15
+    try:
+        payout = float(payout_percent)
+    except (TypeError, ValueError):
+        return False, "Invalid payout"
 
-    # Examine the 3-4 candles immediately before the latest candle.
-    preceding = recent[:-1]
+    if not math.isfinite(payout) or payout < MIN_PAYOUT_PERCENT:
+        return False, "Payout below 80%"
 
-    run_color = None
-    run_length = 0
+    df = _make_frame(candles)
+    if len(df) < 25:
+        return False, "Not enough closed candles"
 
-    for candle in reversed(preceding):
-        color = candle_color(candle)
+    # Inspect gaps only in recent candles.
+    recent = df.tail(5)
+    timestamps = recent["timestamp"].tolist()
+    for a, b in zip(timestamps, timestamps[1:]):
+        if b - a > candle_seconds * 1.5:
+            return False, "Recent candle gap"
 
-        if color == "DOJI":
-            break
-
-        if run_color is None:
-            run_color = color
-            run_length = 1
-
-        elif color == run_color:
-            run_length += 1
-
+    # Three consecutive doji candles, counted from the latest closed candle.
+    doji_count = 0
+    for c in reversed(df.tail(3).to_dict("records")):
+        r = c["high"] - c["low"]
+        body = abs(c["close"] - c["open"])
+        if r > 0 and body / r <= DOJI_BODY_RATIO:
+            doji_count += 1
         else:
             break
 
-        if run_length >= 5:
-            break
+    if doji_count >= 3:
+        return False, "3 consecutive doji candles"
 
-    if run_length not in (3, 4):
-        return None
+    # Large wick on at least 3 of the latest 4 candles.
+    recent4 = df.tail(4)
+    large_wicks = 0
+    ranges = []
 
-    run_candles = preceding[-run_length:]
+    for c in recent4.to_dict("records"):
+        r = c["high"] - c["low"]
+        if r <= 0:
+            continue
+        uw = c["high"] - max(c["open"], c["close"])
+        lw = min(c["open"], c["close"]) - c["low"]
+        if max(uw / r, lw / r) >= LARGE_WICK_RATIO:
+            large_wicks += 1
+        ranges.append(r)
 
-    # All candles in the run must be reasonably clean.
-    for candle in run_candles:
-        good, _ = candle_is_good(
-            candle,
-            recent[-10:],
-        )
+    if large_wicks >= 3:
+        return False, "Large wicks in recent candles"
 
-        if not good:
-            return None
+    # Abnormally fast movement: compare last 4 ranges with prior 20.
+    baseline_rows = df.iloc[-24:-4]
+    baseline_ranges = (
+        baseline_rows["high"] - baseline_rows["low"]
+    ).tolist()
+    baseline_ranges = [r for r in baseline_ranges if r > 0]
 
-    support = min(
-        candle["low"] for candle in recent[-20:]
-    )
-    resistance = max(
-        candle["high"] for candle in recent[-20:]
-    )
+    if baseline_ranges and ranges:
+        baseline = float(np.median(baseline_ranges))
+        if baseline > 0:
+            if max(ranges) > 2.5 * baseline:
+                return False, "Abnormally fast movement"
+            if sum(r > 2 * baseline for r in ranges) >= 2:
+                return False, "Repeated fast movement"
 
-    # Setup A: bearish trend, consecutive red candles,
-    # then a green pullback candle => PUT candidate.
-    if (
-        run_color == "RED"
-        and latest_color == "GREEN"
-        and fast_ma < slow_ma
-    ):
-        return result(
-            direction="PUT",
-            score=-2.0,
-            support=support,
-            resistance=resistance,
-            candle=latest,
-            reasons=[
-                f"Bearish trend: fast MA below slow MA",
-                f"{run_length} consecutive red candles",
-                "Green candle treated as a pullback",
-                "Candle quality and volatility filters passed",
-            ],
-            strategy_name="3-4 Candle Continuation",
-        )
-
-    # Setup B: bullish trend, consecutive green candles,
-    # then a red pullback candle => CALL candidate.
-    if (
-        run_color == "GREEN"
-        and latest_color == "RED"
-        and fast_ma > slow_ma
-    ):
-        return result(
-            direction="CALL",
-            score=2.0,
-            support=support,
-            resistance=resistance,
-            candle=latest,
-            reasons=[
-                "Bullish trend: fast MA above slow MA",
-                f"{run_length} consecutive green candles",
-                "Red candle treated as a pullback",
-                "Candle quality and volatility filters passed",
-            ],
-            strategy_name="3-4 Candle Continuation",
-        )
-
-    return None
+    return True, "OK"
 
 
-# =========================================================
-# ORIGINAL STRATEGY — PRESERVED
-# =========================================================
+def _swing_levels(d, left=5, right=5):
+    """Only expose swing levels after all right-side candles are closed."""
+    highs, lows = [], []
+    high_values = d["high"].to_numpy()
+    low_values = d["low"].to_numpy()
 
-def original_strategy(candles):
-    """
-    Original heuristic:
-    trend + swing structure + support/resistance
-    + engulfing/wick patterns + momentum.
-    """
-    if len(candles) < 25:
-        return None
+    for i in range(left, len(d) - right):
+        if high_values[i] >= max(high_values[i-left:i+right+1]):
+            highs.append((i + right, high_values[i]))
+        if low_values[i] <= min(low_values[i-left:i+right+1]):
+            lows.append((i + right, low_values[i]))
 
-    candles = sorted(
-        candles,
-        key=lambda item: item["time"],
+    last_index = len(d) - 1
+    return (
+        [price for confirmed_at, price in highs if confirmed_at <= last_index],
+        [price for confirmed_at, price in lows if confirmed_at <= last_index],
     )
 
-    recent = candles[-25:]
-    closes = [item["close"] for item in recent]
 
-    last = recent[-1]
-    previous = recent[-2]
+def _get_signals(d):
+    i = len(d) - 1
+    x = d.iloc[i]
+    p = d.iloc[i - 1]
+    found = []
 
-    score = 0.0
-    reasons = []
+    def add(name, direction, reason):
+        found.append({
+            "strategy": name,
+            "direction": direction,
+            "reason": reason,
+        })
 
-    # 1. Short-term trend.
-    fast_ma = sum(closes[-5:]) / 5
-    slow_ma = sum(closes[-15:]) / 15
-
-    if fast_ma > slow_ma:
-        score += 1.3
-        reasons.append("Short-term bullish trend")
-
-    elif fast_ma < slow_ma:
-        score -= 1.3
-        reasons.append("Short-term bearish trend")
-
-    # 2. Recent swing structure.
-    highs = [
-        candle["high"]
-        for candle in recent[-8:]
-    ]
-
-    lows = [
-        candle["low"]
-        for candle in recent[-8:]
-    ]
+    # 1. EMA Trend Pullback
+    up = (
+        x.ema20 > x.ema50 > x.ema200
+        and x.ema50 > d.iloc[i-5].ema50
+        and x.adx > 22
+    )
+    down = (
+        x.ema20 < x.ema50 < x.ema200
+        and x.ema50 < d.iloc[i-5].ema50
+        and x.adx > 22
+    )
+    start = max(0, i - 2)
+    touched = (
+        d["low"].iloc[start:i+1]
+        <= d["ema20"].iloc[start:i+1]
+    ).any()
 
     if (
-        highs[-1] > max(highs[:-2])
-        and lows[-1] > min(lows[:-2])
+        up and touched and x.close > x.open
+        and x.close > p.high and x.close > x.ema20
+        and x.body_ratio >= 0.50
+        and abs(x.ema20 - x.ema50) >= 0.3 * x.atr
+        and abs(x.close - x.ema20) <= 1.5 * x.atr
     ):
-        score += 0.8
-        reasons.append(
-            "Higher-high / higher-low structure"
-        )
-
+        add("EMA Trend Pullback", "CALL", "Uptrend pullback")
     elif (
-        lows[-1] < min(lows[:-2])
-        and highs[-1] < max(highs[:-2])
+        down and touched and x.close < x.open
+        and x.close < p.low and x.close < x.ema20
+        and x.body_ratio >= 0.50
+        and abs(x.ema20 - x.ema50) >= 0.3 * x.atr
+        and abs(x.close - x.ema20) <= 1.5 * x.atr
     ):
-        score -= 0.8
-        reasons.append(
-            "Lower-low / lower-high structure"
-        )
+        add("EMA Trend Pullback", "PUT", "Downtrend pullback")
 
-    # 3. Support and resistance.
-    window = recent[-20:]
-
-    support = min(
-        candle["low"] for candle in window
+    # 2. RSI Reversal in range market
+    range_market = (
+        x.adx < 20
+        and abs(x.ema50 - d.iloc[i-10].ema50) < 0.5 * x.atr
     )
-
-    resistance = max(
-        candle["high"] for candle in window
-    )
-
-    price_range = max(
-        resistance - support,
-        1e-12,
-    )
-
-    near_support = (
-        last["close"] - support
-    ) / price_range < 0.15
-
-    near_resistance = (
-        resistance - last["close"]
-    ) / price_range < 0.15
-
-    if near_support and last["close"] > last["open"]:
-        score += 0.7
-        reasons.append("Bullish support reaction")
-
-    elif (
-        near_resistance
-        and last["close"] < last["open"]
-    ):
-        score -= 0.7
-        reasons.append("Bearish resistance reaction")
-
-    # 4. Engulfing patterns.
+    last5rsi = d["rsi"].iloc[max(0, i-4):i+1]
     if (
-        last["close"] > last["open"]
-        and previous["close"] < previous["open"]
-        and last["close"] >= previous["open"]
-        and last["open"] <= previous["close"]
+        range_market and not (last5rsi < 30).all()
+        and p.rsi < 30 <= x.rsi and x.close > x.open
     ):
-        score += 1.0
-        reasons.append("Bullish engulfing")
-
+        add("RSI Reversal", "CALL", "RSI crossed up from oversold")
     elif (
-        last["close"] < last["open"]
-        and previous["close"] > previous["open"]
-        and last["close"] <= previous["open"]
-        and last["open"] >= previous["close"]
+        range_market and not (last5rsi > 70).all()
+        and p.rsi > 70 >= x.rsi and x.close < x.open
     ):
-        score -= 1.0
-        reasons.append("Bearish engulfing")
+        add("RSI Reversal", "PUT", "RSI crossed down from overbought")
 
-    # 5. Wick rejection.
-    body = candle_body(last)
-    lower = lower_wick(last)
-    upper = upper_wick(last)
+    # 3. Bollinger Band Re-entry
+    if (
+        p.close < p.bb_lower and x.close > x.bb_lower
+        and x.lower_wick >= 0.40
+        and x.close > (x.high + x.low) / 2
+        and x.adx < 25
+    ):
+        add("Bollinger Re-entry", "CALL", "Lower-band re-entry")
+    elif (
+        p.close > p.bb_upper and x.close < x.bb_upper
+        and x.upper_wick >= 0.40
+        and x.close < (x.high + x.low) / 2
+        and x.adx < 25
+    ):
+        add("Bollinger Re-entry", "PUT", "Upper-band re-entry")
+
+    # 4. Confirmed Support/Resistance + Engulfing
+    swing_highs, swing_lows = _swing_levels(d)
+    support = any(abs(x.low - level) <= 0.3 * x.atr for level in swing_lows)
+    resistance = any(
+        abs(x.high - level) <= 0.3 * x.atr for level in swing_highs
+    )
+    bullish_engulf = (
+        x.close > x.open and p.close < p.open
+        and x.open <= p.close and x.close >= p.open
+    )
+    bearish_engulf = (
+        x.close < x.open and p.close > p.open
+        and x.open >= p.close and x.close <= p.open
+    )
 
     if (
-        body > 0
-        and lower > body * 1.8
-        and lower > upper
+        support and bullish_engulf and x.close > x.ema100
+        and x.body >= 0.8 * x.atr
     ):
-        score += 0.5
-        reasons.append("Lower-wick rejection")
-
+        add("S/R Engulfing", "CALL", "Bullish engulfing near support")
     elif (
-        body > 0
-        and upper > body * 1.8
-        and upper > lower
+        resistance and bearish_engulf and x.close < x.ema100
+        and x.body >= 0.8 * x.atr
     ):
-        score -= 0.5
-        reasons.append("Upper-wick rejection")
+        add("S/R Engulfing", "PUT", "Bearish engulfing near resistance")
 
-    # 6. Momentum.
-    changes = [
-        closes[index] - closes[index - 1]
-        for index in range(1, len(closes))
-    ]
+    # 5. MACD Cross + Trend Filter
+    cross_up = p.macd_hist <= 0 < x.macd_hist
+    cross_down = p.macd_hist >= 0 > x.macd_hist
+    hist = d["macd_hist"].tail(11)
+    prev_hist = d["macd_hist"].shift(1).tail(11)
+    cross_count = int((hist * prev_hist < 0).sum())
 
-    positive = sum(
-        value for value in changes[-10:]
-        if value > 0
+    if (
+        cross_up and x.close > x.ema100 and x.adx > 20
+        and x.macd > 0 and abs(x.macd_hist) >= 0.05 * x.atr
+        and cross_count < 3
+    ):
+        add("MACD Cross", "CALL", "Bullish MACD cross")
+    elif (
+        cross_down and x.close < x.ema100 and x.adx > 20
+        and x.macd < 0 and abs(x.macd_hist) >= 0.05 * x.atr
+        and cross_count < 3
+    ):
+        add("MACD Cross", "PUT", "Bearish MACD cross")
+
+    # 6. Squeeze Breakout
+    percentile = d["bb_width"].rolling(100).quantile(0.15)
+    squeezed = (
+        (d["bb_width"] <= percentile).tail(5).sum() >= 5
     )
+    don_high = d["high"].rolling(20).max().shift(1).iloc[i]
+    don_low = d["low"].rolling(20).min().shift(1).iloc[i]
 
-    negative = abs(sum(
-        value for value in changes[-10:]
-        if value < 0
-    ))
+    if (
+        squeezed and x.close > don_high
+        and x.body_ratio >= 0.60 and x.range >= 1.2 * x.atr
+        and x.upper_wick <= 0.40
+    ):
+        add("Squeeze Breakout", "CALL", "Upside squeeze breakout")
+    elif (
+        squeezed and x.close < don_low
+        and x.body_ratio >= 0.60 and x.range >= 1.2 * x.atr
+        and x.lower_wick <= 0.40
+    ):
+        add("Squeeze Breakout", "PUT", "Downside squeeze breakout")
 
-    momentum = (
-        (positive - negative)
-        / max(positive + negative, 1e-12)
-    )
+    # 7. M5 trend + M1 stochastic trigger.
+    # Only use completed M5 bars; never use future data.
+    m1 = d.copy()
+    m1["dt"] = pd.to_datetime(m1["timestamp"], unit="s", utc=True)
+    m1 = m1.set_index("dt")
 
-    score += momentum * 0.7
+    m5 = m1.resample("5min", label="right", closed="right").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }).dropna()
 
-    reasons.append(
-        "Bullish momentum"
-        if momentum > 0.2
-        else "Bearish momentum"
-        if momentum < -0.2
-        else "Mixed momentum"
-    )
+    m5["ema50"] = m5["close"].ewm(span=50, adjust=False).mean()
+    m5["slope"] = m5["ema50"].diff()
 
-    direction = (
-        "WAIT"
-        if abs(score) < 0.8
-        else "CALL"
-        if score > 0
-        else "PUT"
-    )
+    # The M5 candle must close no later than the latest closed M1 candle.
+    latest_m1_close = m1.index[-1] + pd.Timedelta(minutes=1)
+    m5 = m5[m5.index <= latest_m1_close]
 
-    return result(
-        direction=direction,
-        score=score,
-        support=support,
-        resistance=resistance,
-        candle=last,
-        reasons=reasons,
-        strategy_name="Original Scoring Strategy",
-    )
+    if len(m5) >= 51:
+        mt = m5.iloc[-1]
+        m5_up = mt.close > mt.ema50 and mt.slope > 0
+        m5_down = mt.close < mt.ema50 and mt.slope < 0
+
+        last10k = d["stoch_k"].tail(10)
+        stuck_low = (last10k < 20).all()
+        stuck_high = (last10k > 80).all()
+
+        if (
+            m5_up and x.adx > 20 and not stuck_low
+            and p.stoch_k <= p.stoch_d
+            and x.stoch_k > x.stoch_d
+            and p.stoch_k < 20 and x.close > x.open
+        ):
+            add("MTF Stochastic Pullback", "CALL", "M5 uptrend + M1 trigger")
+        elif (
+            m5_down and x.adx > 20 and not stuck_high
+            and p.stoch_k >= p.stoch_d
+            and x.stoch_k < x.stoch_d
+            and p.stoch_k > 80 and x.close < x.open
+        ):
+            add("MTF Stochastic Pullback", "PUT", "M5 downtrend + M1 trigger")
+
+    return found
 
 
-# =========================================================
-# PUBLIC FUNCTION — USED BY main.py
-# =========================================================
-
-def analyse(candles):
-    """
-    First checks the new continuation setup.
-    If it does not trigger, uses the original strategy.
-
-    Both return the same result structure expected by main.py.
-    """
-    if not isinstance(candles, (list, tuple)):
-        return None
-
-    normalized = []
-
-    for raw in candles:
-        candle = normalize_candle(raw)
-
-        if candle is not None:
-            normalized.append(candle)
-
-    # Sort and remove duplicate timestamps.
-    by_time = {
-        candle["time"]: candle
-        for candle in normalized
+def _wait(reason):
+    return {
+        "direction": "WAIT",
+        "score": 0,
+        "confidence": 0,
+        "support": None,
+        "resistance": None,
+        "candle": None,
+        "reasons": [reason],
+        "strategy": "Seven-Strategy Engine",
     }
 
-    normalized = sorted(
-        by_time.values(),
-        key=lambda item: item["time"],
+
+def analyse(candles, candle_seconds=60, payout_percent=None):
+    """
+    Backward-compatible strategy interface.
+    Pass closed candles only; do not pass an in-progress candle.
+    """
+    df = _make_frame(candles)
+
+    if len(df) < MIN_CANDLES:
+        return _wait(f"Need {MIN_CANDLES} candles")
+
+    # NOTE: Do not remove the final row here. Caller must provide closed candles.
+    # This preserves the latest closed candle for analysis.
+    allowed, reason = market_filter(
+        df.to_dict("records"),
+        payout_percent=payout_percent,
+        candle_seconds=candle_seconds,
     )
+    if not allowed:
+        return _wait(f"Market filtered: {reason}")
 
-    if len(normalized) < 25:
-        return None
+    d = _indicators(df)
+    needed = [
+        "ema20", "ema50", "ema100", "ema200", "atr",
+        "adx", "rsi", "bb_upper", "bb_lower",
+        "macd", "macd_hist", "stoch_k", "stoch_d",
+        "body_ratio", "atr_median50",
+    ]
+    if d.iloc[-1][needed].isna().any():
+        return _wait("Indicators not ready")
 
-    # New setup has priority.
-    new_result = continuation_strategy(normalized)
+    # Apply the existing ATR dead-market and spike checks.
+    last = d.iloc[-1]
+    if last.atr < 0.7 * last.atr_median50:
+        return _wait("Low volatility")
+    if last["range"] > 2.5 * last.atr:
+        return _wait("Signal candle spike")
 
-    if new_result is not None:
-        return new_result
+    found = _get_signals(d)
+    if not found:
+        return _wait("No strategy setup")
 
-    # Preserve the original strategy as a fallback.
-    return original_strategy(normalized)
+    directions = {s["direction"] for s in found}
+    if len(directions) != 1:
+        return _wait("Conflicting strategy signals")
+
+    direction = directions.pop()
+    last = d.iloc[-1]
+
+    return {
+        "direction": direction,
+        "score": len(found),
+        # This is a display score, NOT a probability of winning.
+        "confidence": min(95, 50 + 7 * len(found)),
+        "support": float(d["low"].tail(20).min()),
+        "resistance": float(d["high"].tail(20).max()),
+        "candle": int(last["timestamp"]),
+        "reasons": [s["reason"] for s in found],
+        "strategy": ", ".join(s["strategy"] for s in found),
+    }
+
+
+def backtest(df, sig, expiry=1, payout=0.85):
+    """
+    Signal on row i close -> entry row i+1 open.
+    Expiry 1 -> exit row i+1 close.
+    Expiry 2 -> exit row i+2 close.
+    """
+    if expiry < 1:
+        raise ValueError("expiry must be >= 1")
+    if not 0 < payout <= 1:
+        raise ValueError("payout must be between 0 and 1")
+
+    data = df.reset_index(drop=True).copy()
+    signal = pd.Series(sig).reset_index(drop=True)
+
+    entry = data["open"].shift(-1)
+    exit_price = data["close"].shift(-expiry)
+
+    win = (
+        ((signal == 1) & (exit_price > entry))
+        | ((signal == -1) & (exit_price < entry))
+    )
+    tie = exit_price.eq(entry)
+    valid = signal.ne(0) & ~tie & entry.notna() & exit_price.notna()
+    n = int(valid.sum())
+
+    if not n:
+        return {
+            "trades": 0,
+            "win_rate": 0.0,
+            "expectancy": 0.0,
+            "breakeven_win_rate": 1 / (1 + payout),
+        }
+
+    wr = float(win[valid].sum() / n)
+    return {
+        "trades": n,
+        "win_rate": wr,
+        "expectancy": wr * payout - (1 - wr),
+        "breakeven_win_rate": 1 / (1 + payout),
+    }
