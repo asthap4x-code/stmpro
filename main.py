@@ -12,7 +12,7 @@ from telegram.ext import (
 from pyquotex.stable_api import Quotex
 from strategy import analyse, normalize_candle, candle_color
 
-TG_TOKEN = os.getenv("TG_BOT_TOKEN", "AAHUukYR7Gl3Mg3DzGRVN9Y_0wxWA1d8N9M")
+TG_TOKEN = os.getenv("TG_BOT_TOKEN", "8994179085:AAEbtj-dnNOzWiteG1fz1CGiddUOpRfQBNs)
 CHANNEL_ID = os.getenv("TG_CHANNEL_ID", "1004308221939")
 EMAIL = os.getenv("QUOTEX_EMAIL", "janinakihoy00@gmail.com")
 PASSWORD = os.getenv("QUOTEX_PASSWORD", "71&@$@HwvIvw&$#")
