@@ -1,12 +1,7 @@
 
-"""
-STM PRO BOT — Main
-Telegram + PyQuotex data adapter + SQLite history.
-Signal-only mode; does not place trades.
-"""
-
 import asyncio
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -15,788 +10,1068 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
 )
+
+from pyquotex.stable_api import Quotex
 
 from ai_strategy import analyze_ai
 from all_strategy import analyze_all
 
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 load_dotenv()
 
-TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("TG_CHANNEL_ID", "").strip()
-Q_EMAIL = os.getenv("QUOTEX_EMAIL", "").strip()
-Q_PASSWORD = os.getenv("QUOTEX_PASSWORD", "").strip()
-TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Male")
+TG_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID", "").strip()
+
+QUOTEX_EMAIL = os.getenv("QUOTEX_EMAIL", "").strip()
+QUOTEX_PASSWORD = os.getenv("QUOTEX_PASSWORD", "").strip()
+
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Male")
 MIN_PAYOUT = float(os.getenv("MIN_PAYOUT", "80"))
 MAX_ASSETS = int(os.getenv("MAX_ASSETS", "100"))
-CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY", "8"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
+SCAN_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY", "4"))
+SCAN_INTERVAL_SECONDS = float(
+    os.getenv("SCAN_INTERVAL_SECONDS", "5")
+)
 MIN_SCORE = float(os.getenv("MIN_SCORE", "1.5"))
+
+# Publish 5 seconds before the next minute begins.
+SIGNAL_LEAD_SECONDS = 5
+
 DB_FILE = "stm_history.sqlite3"
 
-TZ = ZoneInfo(TIMEZONE)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("STM-PRO")
 
-# Per-user UI state
-STATE = {}
-SCANNER_TASK = None
-SCANNER_RUNNING = False
-QUOTEX = None
-SEMAPHORE = asyncio.Semaphore(max(1, CONCURRENCY))
+log = logging.getLogger("STM_PRO_BOT")
+
+try:
+    TZ = ZoneInfo(BOT_TIMEZONE)
+except Exception:
+    TZ = ZoneInfo("UTC")
 
 
-# -------------------- DATABASE --------------------
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
-def db():
-    conn = sqlite3.connect(DB_FILE, timeout=15)
+client = None
+client_lock = asyncio.Lock()
+scan_task = None
+
+STATE = {
+    "running": False,
+    "owner_id": None,
+    "category": "ALL",
+    "assets": [],
+    "strategy": "ALL",
+}
+
+ASSET_CACHE = []
+ASSET_LOCK = asyncio.Lock()
+SEMAPHORE = asyncio.Semaphore(max(1, SCAN_CONCURRENCY))
+
+
+# ============================================================
+# SQLITE DATABASE
+# ============================================================
+
+def db_connect():
+    conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
-    with db() as conn:
+    with db_connect() as conn:
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_key TEXT UNIQUE,
-            asset TEXT,
-            direction TEXT,
-            strategy TEXT,
-            entry_time INTEGER,
-            payout REAL,
-            score REAL,
-            reason TEXT,
-            result TEXT DEFAULT 'PENDING',
-            details TEXT,
-            created_at INTEGER
-        )
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                score REAL DEFAULT 0,
+                payout REAL DEFAULT 0,
+                signal_time INTEGER NOT NULL,
+                entry_time INTEGER NOT NULL,
+                result TEXT DEFAULT 'PENDING',
+                result_source TEXT DEFAULT 'CANDLE_ESTIMATE',
+                mtg1_result TEXT DEFAULT 'NOT_USED',
+                reason TEXT DEFAULT '',
+                UNIQUE(asset, entry_time, strategy)
+            )
         """)
+        conn.commit()
 
 
-def already_sent(key):
-    with db() as conn:
-        return conn.execute(
-            "SELECT 1 FROM signals WHERE signal_key=?", (key,)
-        ).fetchone() is not None
-
-
-def save_signal(item, entry_time, strategy):
-    key = f"{item['asset']}|{entry_time}|{strategy}"
-    with db() as conn:
+def save_signal(
+    asset,
+    direction,
+    strategy,
+    score,
+    payout,
+    signal_time,
+    entry_time,
+    reason,
+):
+    with db_connect() as conn:
         cur = conn.execute("""
-        INSERT OR IGNORE INTO signals
-        (signal_key,asset,direction,strategy,entry_time,payout,
-         score,reason,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+            INSERT OR IGNORE INTO signals (
+                asset, direction, strategy, score, payout,
+                signal_time, entry_time, reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            key, item["asset"], item["direction"], strategy,
-            entry_time, item["payout"], item["score"],
-            item["reason"], int(time.time())
+            asset,
+            direction,
+            strategy,
+            score,
+            payout,
+            signal_time,
+            entry_time,
+            reason,
         ))
+        conn.commit()
+
+        # Do not republish a duplicate signal.
         if cur.rowcount == 0:
-            row = conn.execute(
-                "SELECT id FROM signals WHERE signal_key=?", (key,)
-            ).fetchone()
-            return row["id"] if row else None
+            return None
+
         return cur.lastrowid
 
 
-def update_result(signal_id, result, details):
-    with db() as conn:
-        conn.execute(
-            "UPDATE signals SET result=?, details=? WHERE id=?",
-            (result, details, signal_id)
-        )
+def update_result(signal_id, result, source, mtg1_result="NOT_USED"):
+    with db_connect() as conn:
+        conn.execute("""
+            UPDATE signals
+            SET result = ?,
+                result_source = ?,
+                mtg1_result = ?
+            WHERE id = ?
+        """, (result, source, mtg1_result, signal_id))
+        conn.commit()
 
 
-# -------------------- QUOTEX CONNECTOR --------------------
+# ============================================================
+# PYQUOTEX CONNECTION
+# ============================================================
 
-class QuotexFeed:
+async def connect_quotex():
     """
-    PyQuotex is unofficial. Exact API varies between forks.
-    Verify the installed package before relying on live data.
+    Connect to the unofficial PyQuotex client.
+    This bot does not place trades.
     """
+    global client
 
-    def __init__(self):
-        self.client = None
+    async with client_lock:
+        if client is not None:
+            try:
+                if await client.check_connect():
+                    return True
+            except Exception:
+                pass
 
-    async def connect(self):
-        if not Q_EMAIL or not Q_PASSWORD:
-            raise RuntimeError(
-                "Set QUOTEX_EMAIL and QUOTEX_PASSWORD in .env"
+        if not QUOTEX_EMAIL or not QUOTEX_PASSWORD:
+            log.error("Set QUOTEX_EMAIL and QUOTEX_PASSWORD in .env")
+            return False
+
+        try:
+            client = Quotex(
+                email=QUOTEX_EMAIL,
+                password=QUOTEX_PASSWORD,
+                lang="en",
             )
 
-        try:
-            from pyquotex.stable_api import Quotex
-        except ImportError:
-            from pyquotex import Quotex
+            ok, message = await client.connect()
 
-        self.client = Quotex(
-            email=Q_EMAIL,
-            password=Q_PASSWORD,
-            lang="en"
-        )
+            if not ok:
+                log.error("Quotex connection failed: %s", message)
+                client = None
+                return False
 
-        result = await self.client.connect()
-        if isinstance(result, tuple):
-            success = bool(result[0])
-            message = result[1] if len(result) > 1 else ""
-        else:
-            success, message = bool(result), ""
+            log.info("PyQuotex connected.")
+            return True
 
-        if not success:
-            raise RuntimeError(f"Quotex connection failed: {message}")
-
-        return True
-
-    async def assets(self):
-        raw = await self.client.get_all_assets()
-        if isinstance(raw, dict):
-            return list(raw.keys())
-        return list(raw or [])
-
-    async def payout(self, asset):
-        try:
-            payments = self.client.get_payment()
-            if asyncio.iscoroutine(payments):
-                payments = await payments
-
-            row = payments.get(asset, {})
-            profit = row.get("profit", {})
-            value = profit.get("1M")
-
-            if value is None:
-                value = row.get("turbo_payment", row.get("payment"))
-
-            if value is None:
-                return None
-
-            value = float(value)
-            return value * 100 if 0 < value <= 1 else value
         except Exception:
-            log.debug("Payout unavailable: %s", asset, exc_info=True)
-            return None
+            log.exception("PyQuotex connection error")
+            client = None
+            return False
 
-    async def candles(self, asset, count=180, period=60):
-        end = time.time()
-        raw = await self.client.get_candles(
-            asset, end, count, period
+
+async def close_quotex():
+    global client
+
+    async with client_lock:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                log.exception("Error closing Quotex connection")
+            finally:
+                client = None
+
+
+async def get_asset_list():
+    """
+    Get asset names from PyQuotex.
+    API support can vary between installed versions.
+    """
+    global ASSET_CACHE
+
+    async with ASSET_LOCK:
+        if ASSET_CACHE:
+            return ASSET_CACHE[:]
+
+        if not await connect_quotex():
+            return []
+
+        try:
+            data = await client.get_all_assets()
+
+            if isinstance(data, dict):
+                assets = list(data.keys())
+            elif isinstance(data, (list, tuple, set)):
+                assets = list(data)
+            else:
+                assets = []
+
+            assets = [
+                str(a) for a in assets
+                if a and isinstance(a, (str, int))
+            ]
+
+            ASSET_CACHE = sorted(set(assets))[:MAX_ASSETS]
+            log.info("Loaded %d assets", len(ASSET_CACHE))
+            return ASSET_CACHE[:]
+
+        except Exception:
+            log.exception("Could not load Quotex assets")
+            return []
+
+
+async def get_candles(asset, count=100):
+    """
+    PyQuotex get_candles(asset, end_from_time, offset, period).
+    Returns normalized candle dictionaries.
+    """
+    if not await connect_quotex():
+        return []
+
+    try:
+        end_time = int(time.time())
+
+        raw = await client.get_candles(
+            asset,
+            end_time,
+            count * 60,
+            60,
         )
+
+        if not raw:
+            return []
 
         result = []
-        for row in raw or []:
+
+        for candle in raw:
+            if not isinstance(candle, dict):
+                continue
+
             try:
-                ts = int(row.get("time", row.get("timestamp")))
-                # Some forks may return milliseconds.
+                ts = int(
+                    candle.get("time", candle.get("timestamp", 0))
+                )
+
                 if ts > 10_000_000_000:
                     ts //= 1000
 
-                item = {
+                op = float(candle["open"])
+                cl = float(candle["close"])
+                hi = float(candle["high"])
+                lo = float(candle["low"])
+
+                if ts <= 0:
+                    continue
+
+                result.append({
                     "time": ts,
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"])
-                }
-                result.append(item)
-            except (ValueError, TypeError, KeyError, AttributeError):
+                    "open": op,
+                    "close": cl,
+                    "high": hi,
+                    "low": lo,
+                })
+
+            except (TypeError, ValueError, KeyError):
                 continue
 
-        # Remove duplicate timestamps and sort oldest to newest.
-        return sorted(
-            {c["time"]: c for c in result}.values(),
-            key=lambda x: x["time"]
-        )
+        result.sort(key=lambda c: c["time"])
 
-    async def close(self):
-        if self.client:
-            method = getattr(self.client, "close", None)
-            if method:
-                result = method()
-                if asyncio.iscoroutine(result):
-                    await result
+        # Remove duplicate timestamps.
+        unique = {c["time"]: c for c in result}
+        return list(unique.values())
+
+    except Exception:
+        log.warning("Candle request failed for %s", asset, exc_info=True)
+        return []
 
 
-# -------------------- CATEGORY FILTERS --------------------
+def get_payout(asset):
+    """
+    Read payout if supported by the installed PyQuotex version.
+    Return None if payout cannot be verified.
+    """
+    if client is None:
+        return None
 
-CRYPTO_WORDS = (
-    "BTC", "ETH", "LTC", "XRP", "DOGE", "SOL", "ADA",
-    "BNB", "DOT", "TRX", "AVAX", "LINK", "TON"
+    try:
+        value = client.get_payout_by_asset(asset, timeframe="1")
+
+        if asyncio.iscoroutine(value):
+            return None
+
+        if isinstance(value, dict):
+            value = value.get("1M", value.get("profit"))
+
+        if value is None:
+            return None
+
+        value = float(value)
+
+        # Some versions may return decimal payout instead of percent.
+        if 0 < value <= 1:
+            value *= 100
+
+        if 0 <= value <= 100:
+            return value
+
+    except Exception:
+        log.debug("Payout unavailable for %s", asset, exc_info=True)
+
+    return None
+
+
+# ============================================================
+# ASSET CATEGORIES
+# ============================================================
+
+CRYPTO_TOKENS = (
+    "BTC", "ETH", "LTC", "XRP", "DOGE",
+    "ADA", "SOL", "BNB", "DOT", "TRX",
 )
-COMMODITY_WORDS = (
-    "GOLD", "SILVER", "XAU", "XAG", "OIL", "BRENT",
-    "WTI", "NATGAS", "NGAS", "COPPER"
+
+COMMODITY_TOKENS = (
+    "XAU", "XAG", "GOLD", "SILVER",
+    "OIL", "BRENT", "WTI", "NGAS",
 )
-FIAT_CODES = {
-    "USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD",
-    "CAD", "SGD", "HKD", "NOK", "SEK", "TRY", "ZAR",
-    "MXN", "PLN", "THB", "IDR", "INR", "BRL", "CNY"
-}
 
 
 def category_of(asset):
-    """
-    CURRENCY means OTC fiat pairs in this bot.
-    FOREX means non-OTC fiat pairs.
-    This is a practical local classification, not an official Quotex taxonomy.
-    """
-    name = asset.upper().replace("/", "").replace("-", "").replace("_", "")
+    upper = asset.upper()
 
-    if any(word in name for word in CRYPTO_WORDS):
+    if any(token in upper for token in CRYPTO_TOKENS):
         return "CRYPTO"
 
-    if any(word in name for word in COMMODITY_WORDS):
+    if any(token in upper for token in COMMODITY_TOKENS):
         return "COMMODITIES"
 
-    otc = "OTC" in name
-    letters = "".join(ch for ch in name if ch.isalpha())
-    letters = letters.replace("OTC", "")
+    if "_OTC" in upper:
+        return "CURRENCY"
 
-    if len(letters) >= 6:
-        first, second = letters[:3], letters[3:6]
-        if first in FIAT_CODES and second in FIAT_CODES:
-            return "CURRENCY" if otc else "FOREX"
-
-    return "OTHER"
+    return "FOREX"
 
 
-async def get_assets_for_category(category):
-    assets = await QUOTEX.assets()
-    if category == "ALL":
-        return assets
-    return [a for a in assets if category_of(a) == category]
+def category_label(category):
+    return {
+        "ALL": "All Markets",
+        "FOREX": "Forex",
+        "CURRENCY": "Currency OTC",
+        "CRYPTO": "Crypto",
+        "COMMODITIES": "Commodities",
+    }.get(category, category)
 
 
-# -------------------- TELEGRAM MENUS --------------------
+# ============================================================
+# TELEGRAM UI
+# ============================================================
 
-def category_keyboard():
+def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌍 FOREX", callback_data="cat:FOREX")],
-        [InlineKeyboardButton("₿ CRYPTO", callback_data="cat:CRYPTO")],
-        [InlineKeyboardButton("💱 CURRENCY (OTC FX)", callback_data="cat:CURRENCY")],
-        [InlineKeyboardButton("🪙 COMMODITIES", callback_data="cat:COMMODITIES")],
-        [InlineKeyboardButton("🌐 ALL CATEGORIES", callback_data="cat:ALL")]
+        [
+            InlineKeyboardButton("🌍 All Markets", callback_data="cat:ALL"),
+        ],
+        [
+            InlineKeyboardButton("💱 Forex", callback_data="cat:FOREX"),
+            InlineKeyboardButton("💹 Currency OTC", callback_data="cat:CURRENCY"),
+        ],
+        [
+            InlineKeyboardButton("₿ Crypto", callback_data="cat:CRYPTO"),
+            InlineKeyboardButton("🪙 Commodities", callback_data="cat:COMMODITIES"),
+        ],
+        [
+            InlineKeyboardButton("📊 Bot Status", callback_data="status"),
+        ],
     ])
 
 
-def pair_keyboard(user_id):
-    state = STATE[user_id]
-    assets = state.get("assets", [])
-    selected = state.setdefault("selected_pairs", set())
-    page = state.get("page", 0)
-    page_size = 20
-    start = page * page_size
-    chunk = assets[start:start + page_size]
+async def show_pairs(query, category):
+    assets = await get_asset_list()
 
-    rows = []
-    for i in range(0, len(chunk), 2):
+    if category != "ALL":
+        assets = [a for a in assets if category_of(a) == category]
+
+    if not assets:
+        await query.edit_message_text(
+            "❌ Quotex থেকে এই ক্যাটাগরির asset list পাওয়া যায়নি।\n"
+            "লগ চেক করো এবং PyQuotex connection পরীক্ষা করো।",
+            reply_markup=main_menu(),
+        )
+        return
+
+    # Avoid huge Telegram inline keyboards.
+    assets = assets[:60]
+    buttons = []
+
+    for i in range(0, len(assets), 2):
         row = []
-        for asset in chunk[i:i + 2]:
-            mark = "✅" if asset in selected else "▫️"
-            # Callback data length must remain short.
-            index = assets.index(asset)
-            row.append(InlineKeyboardButton(
-                f"{mark} {asset}"[:60],
-                callback_data=f"pair:{index}"
-            ))
-        rows.append(row)
+        for asset in assets[i:i + 2]:
+            row.append(
+                InlineKeyboardButton(
+                    f"➕ {asset}",
+                    callback_data=f"asset:{asset}",
+                )
+            )
+        buttons.append(row)
 
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data="page:-1"))
-    if start + page_size < len(assets):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data="page:1"))
-    if nav:
-        rows.append(nav)
-
-    rows.extend([
-        [InlineKeyboardButton("✅ Select ALL pairs", callback_data="pairs:all")],
-        [InlineKeyboardButton("🧹 Clear selection", callback_data="pairs:clear")],
-        [InlineKeyboardButton("➡️ Continue", callback_data="pairs:continue")],
-        [InlineKeyboardButton("🔙 Categories", callback_data="back:categories")]
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-def strategy_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 AI Strategy", callback_data="strategy:ai")],
-        [InlineKeyboardButton("⚡ All Strategy", callback_data="strategy:all")],
-        [InlineKeyboardButton("▶️ Start scanning", callback_data="scanner:start")],
-        [InlineKeyboardButton("🔙 Categories", callback_data="back:categories")]
+    buttons.extend([
+        [
+            InlineKeyboardButton(
+                "✅ Select All Listed",
+                callback_data="select_all",
+            )
+        ],
+        [
+            InlineKeyboardButton("➡️ Choose Strategy", callback_data="strategy_menu"),
+            InlineKeyboardButton("⬅️ Back", callback_data="home"),
+        ],
     ])
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    STATE[uid] = {
-        "category": None,
-        "assets": [],
-        "selected_pairs": set(),
-        "strategy": "all",
-        "page": 0
-    }
-    await update.effective_message.reply_text(
-        "🟦 STM PRO BOT\n\n"
-        "Step 1/3 — Select pair category:",
-        reply_markup=category_keyboard()
-    )
-
-
-async def show_pairs(query, uid, category):
-    try:
-        assets = await get_assets_for_category(category)
-    except Exception as exc:
-        await query.edit_message_text(
-            f"Could not load Quotex assets: {exc}\n"
-            "Check your connector and credentials."
-        )
-        return
-
-    state = STATE.setdefault(uid, {})
-    state["category"] = category
-    state["assets"] = assets[:MAX_ASSETS]
-    state["selected_pairs"] = set()
-    state["page"] = 0
-
-    if not state["assets"]:
-        await query.edit_message_text(
-            f"No assets detected in {category}.\n"
-            "The connector's asset names may need category mapping.",
-            reply_markup=category_keyboard()
-        )
-        return
+    STATE["category"] = category
+    STATE["assets"] = []
 
     await query.edit_message_text(
-        f"Step 2/3 — {category}\n"
-        f"Detected pairs: {len(state['assets'])}\n"
-        "Select individual pairs or select all:",
-        reply_markup=pair_keyboard(uid)
+        f"📂 Category: {category_label(category)}\n\n"
+        "Pair নির্বাচন করো। একাধিক pair নির্বাচন করতে পারো।\n"
+        "Select All Listed চাপলে দেখানো pair-গুলো নির্বাচন হবে.",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def pair_menu():
+    assets = STATE["assets"]
+    buttons = []
+
+    for i in range(0, min(len(assets), 40), 2):
+        row = []
+        for asset in assets[i:i + 2]:
+            row.append(
+                InlineKeyboardButton(
+                    f"✓ {asset}",
+                    callback_data=f"remove:{asset}",
+                )
+            )
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton("➕ Add More Pairs", callback_data="back_pairs"),
+        InlineKeyboardButton("➡️ Strategy", callback_data="strategy_menu"),
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def strategy_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🤖 AI Strategy", callback_data="strat:AI"),
+        ],
+        [
+            InlineKeyboardButton("📈 All Strategy", callback_data="strat:ALL"),
+        ],
+        [
+            InlineKeyboardButton("▶️ Start Scanning", callback_data="start"),
+            InlineKeyboardButton("⏹ Stop", callback_data="stop"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Home", callback_data="home"),
+        ],
+    ])
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 STM PRO BOT\n\n"
+        "PyQuotex market-data connection ব্যবহার করে signal scan করবে।\n"
+        "এটি signal-only bot; স্বয়ংক্রিয়ভাবে trade open করে না।\n\n"
+        "Market category নির্বাচন করো:",
+        reply_markup=main_menu(),
+    )
+
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global scan_task
+
     query = update.callback_query
     await query.answer()
-    uid = query.from_user.id
-    data = query.data or ""
-    state = STATE.setdefault(uid, {
-        "category": None, "assets": [],
-        "selected_pairs": set(), "strategy": "all", "page": 0
-    })
+
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "home":
+        await query.edit_message_text(
+            "Market category নির্বাচন করো:",
+            reply_markup=main_menu(),
+        )
+        return
 
     if data.startswith("cat:"):
-        await show_pairs(query, uid, data.split(":", 1)[1])
+        await show_pairs(query, data.split(":", 1)[1])
         return
 
-    if data == "back:categories":
+    if data.startswith("asset:"):
+        asset = data.split(":", 1)[1]
+
+        if asset not in STATE["assets"]:
+            STATE["assets"].append(asset)
+
         await query.edit_message_text(
-            "Step 1/3 — Select pair category:",
-            reply_markup=category_keyboard()
+            "Selected pairs:\n"
+            + "\n".join(STATE["assets"])
+            + "\n\nআরও pair নির্বাচন করতে Back/Add More ব্যবহার করো।",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("➕ Add More Pairs", callback_data="back_pairs"),
+                    InlineKeyboardButton("➡️ Strategy", callback_data="strategy_menu"),
+                ],
+                [
+                    InlineKeyboardButton("🏠 Home", callback_data="home"),
+                ],
+            ]),
         )
         return
 
-    if data.startswith("page:"):
-        state["page"] = max(
-            0, state.get("page", 0) + int(data.split(":")[1])
-        )
-        await query.edit_message_reply_markup(
-            reply_markup=pair_keyboard(uid)
+    if data == "select_all":
+        assets = await get_asset_list()
+        if STATE["category"] != "ALL":
+            assets = [
+                a for a in assets
+                if category_of(a) == STATE["category"]
+            ]
+        STATE["assets"] = assets[:60]
+
+        await query.edit_message_text(
+            f"✅ Selected {len(STATE['assets'])} pairs.\n"
+            "এখন Strategy নির্বাচন করো।",
+            reply_markup=strategy_menu(),
         )
         return
 
-    if data.startswith("pair:"):
-        idx = int(data.split(":")[1])
-        assets = state.get("assets", [])
-        if 0 <= idx < len(assets):
-            asset = assets[idx]
-            selected = state.setdefault("selected_pairs", set())
-            if asset in selected:
-                selected.remove(asset)
-            else:
-                selected.add(asset)
-        await query.edit_message_reply_markup(
-            reply_markup=pair_keyboard(uid)
+    if data == "back_pairs":
+        await show_pairs(query, STATE["category"])
+        return
+
+    if data == "strategy_menu":
+        await query.edit_message_text(
+            f"Selected pairs: {len(STATE['assets'])}\n"
+            f"Current strategy: {STATE['strategy']}\n\n"
+            "Strategy নির্বাচন করো:",
+            reply_markup=strategy_menu(),
         )
         return
 
-    if data == "pairs:all":
-        state["selected_pairs"] = set(state.get("assets", []))
-        await query.edit_message_reply_markup(
-            reply_markup=pair_keyboard(uid)
+    if data.startswith("strat:"):
+        STATE["strategy"] = data.split(":", 1)[1]
+        await query.edit_message_text(
+            f"Strategy set: {STATE['strategy']}\n"
+            "Start Scanning চাপো।",
+            reply_markup=strategy_menu(),
         )
         return
 
-    if data == "pairs:clear":
-        state["selected_pairs"] = set()
-        await query.edit_message_reply_markup(
-            reply_markup=pair_keyboard(uid)
+    if data == "status":
+        await query.edit_message_text(
+            f"Running: {STATE['running']}\n"
+            f"Selected pairs: {len(STATE['assets'])}\n"
+            f"Strategy: {STATE['strategy']}",
+            reply_markup=main_menu(),
         )
         return
 
-    if data == "pairs:continue":
-        if not state.get("selected_pairs"):
-            await query.message.reply_text(
-                "Select at least one pair or tap Select ALL pairs."
+    if data == "start":
+        if not STATE["assets"]:
+            await query.edit_message_text(
+                "❌ আগে অন্তত একটি pair নির্বাচন করো।",
+                reply_markup=main_menu(),
             )
             return
+
+        if not TG_CHANNEL_ID:
+            await query.edit_message_text(
+                "❌ .env-এ TG_CHANNEL_ID সেট করা নেই।",
+                reply_markup=strategy_menu(),
+            )
+            return
+
+        if not await connect_quotex():
+            await query.edit_message_text(
+                "❌ Quotex connection failed.\n"
+                "Credentials এবং PyQuotex install পরীক্ষা করো।",
+                reply_markup=strategy_menu(),
+            )
+            return
+
+        STATE["owner_id"] = user_id
+        STATE["running"] = True
+
+        if scan_task is None or scan_task.done():
+            scan_task = asyncio.create_task(
+                scanning_loop(context.application)
+            )
+
         await query.edit_message_text(
-            "Step 3/3 — Select strategy:",
-            reply_markup=strategy_keyboard()
+            "✅ STM PRO BOT scanning started.\n"
+            f"Pairs: {len(STATE['assets'])}\n"
+            f"Strategy: {STATE['strategy']}\n"
+            f"Minimum payout: {MIN_PAYOUT}%\n\n"
+            "Signal channel-এ publish হবে।",
+            reply_markup=strategy_menu(),
         )
         return
 
-    if data.startswith("strategy:"):
-        state["strategy"] = data.split(":", 1)[1]
+    if data == "stop":
+        if STATE["owner_id"] not in (None, user_id):
+            await query.edit_message_text(
+                "শুধু bot শুরু করা user scanning বন্ধ করতে পারবে।",
+                reply_markup=strategy_menu(),
+            )
+            return
+
+        STATE["running"] = False
         await query.edit_message_text(
-            f"Selected strategy: {state['strategy'].upper()}\n"
-            f"Category: {state.get('category')}\n"
-            f"Pairs selected: {len(state.get('selected_pairs', []))}\n"
-            "Press Start scanning when ready.",
-            reply_markup=strategy_keyboard()
+            "⏹ Scanning stopped.",
+            reply_markup=main_menu(),
         )
-        return
-
-    if data == "scanner:start":
-        await start_scanner(context.application, uid)
-        await query.message.reply_text(
-            "Scanner started. Use /stopscan to stop it."
-        )
-        return
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "/start — select category, pairs and strategy\n"
-        "/startscan — start scanner\n"
-        "/stopscan — stop scanner\n"
-        "/status — scanner status\n"
-        "/stats — results history"
-    )
+# ============================================================
+# STRATEGY ANALYSIS
+# ============================================================
+
+def analyze_candles(candles, strategy):
+    if strategy == "AI":
+        return analyze_ai(candles)
+
+    return analyze_all(candles)
 
 
-# -------------------- SIGNAL ENGINE --------------------
-
-def normalize_signal(raw):
-    if not raw:
-        return None
-    if raw.get("direction") not in ("CALL", "PUT"):
-        return None
-    if float(raw.get("score", 0)) < MIN_SCORE:
-        return None
-    return raw
-
-
-async def analyze_asset(asset, strategy):
+async def analyze_asset(asset):
     async with SEMAPHORE:
-        try:
-            candles = await QUOTEX.candles(asset, 180, 60)
-            if len(candles) < 60:
-                return None
+        candles = await get_candles(asset, 100)
 
-            # Reject stale market data.
-            if int(time.time()) - candles[-1]["time"] > 150:
-                return None
+    if len(candles) < 60:
+        return None
 
-            payout = await QUOTEX.payout(asset)
-            if payout is None or payout < MIN_PAYOUT:
-                return None
+    # Require recent candle data.
+    latest_time = candles[-1]["time"]
+    if abs(time.time() - latest_time) > 150:
+        log.debug("Skipping stale candles for %s", asset)
+        return None
 
-            if strategy == "ai":
-                signal = analyze_ai(candles)
-            else:
-                signal = analyze_all(candles)
+    payout = get_payout(asset)
 
-            signal = normalize_signal(signal)
-            if not signal:
-                return None
+    # Unknown payout is not treated as 80%.
+    if payout is None or payout < MIN_PAYOUT:
+        return None
 
-            return {
-                "asset": asset,
-                "direction": signal["direction"],
-                "score": float(signal["score"]),
-                "reason": signal.get("reason", "Rule-based setup"),
-                "payout": payout
-            }
-        except Exception:
-            log.debug("Analysis failed for %s", asset, exc_info=True)
+    try:
+        result = analyze_candles(candles, STATE["strategy"])
+    except Exception:
+        log.exception("Strategy failed for %s", asset)
+        return None
+
+    if not result:
+        return None
+
+    direction = str(result.get("direction", "")).upper()
+    score = float(result.get("score", 0))
+    reason = str(result.get("reason", ""))
+
+    if direction not in ("CALL", "PUT"):
+        return None
+
+    if score < MIN_SCORE:
+        return None
+
+    # Avoid extreme last-candle spikes.
+    last = candles[-1]
+    ranges = [
+        max(c["high"] - c["low"], 0)
+        for c in candles[-21:-1]
+    ]
+
+    if ranges:
+        average_range = sum(ranges) / len(ranges)
+        last_range = max(last["high"] - last["low"], 0)
+
+        if average_range > 0 and last_range > average_range * 2.5:
+            log.info("Skipped spike candle: %s", asset)
             return None
 
+    return {
+        "asset": asset,
+        "direction": direction,
+        "score": score,
+        "payout": payout,
+        "reason": reason,
+        "strategy": STATE["strategy"],
+    }
 
-def time_text(timestamp):
-    return datetime.fromtimestamp(timestamp, TZ).strftime("%H:%M:%S")
+
+# ============================================================
+# SIGNAL PUBLISHING
+# ============================================================
+
+def next_minute_timestamp(now=None):
+    if now is None:
+        now = time.time()
+
+    return (int(now) // 60 + 1) * 60
 
 
-async def publish(context, message):
-    if not CHANNEL_ID:
-        log.warning("TG_CHANNEL_ID is empty; not publishing to channel.")
+def format_time(timestamp):
+    return datetime.fromtimestamp(
+        timestamp, TZ
+    ).strftime("%H:%M:%S")
+
+
+async def publish_signal(application, signal, entry_time):
+    now = int(time.time())
+
+    # Skip stale signals. Never publish a signal after entry.
+    if now >= entry_time - 2:
+        log.info("Skipped late signal for %s", signal["asset"])
         return
-    await context.bot.send_message(chat_id=CHANNEL_ID, text=message)
+
+    signal_time = now
+
+    signal_id = save_signal(
+        asset=signal["asset"],
+        direction=signal["direction"],
+        strategy=signal["strategy"],
+        score=signal["score"],
+        payout=signal["payout"],
+        signal_time=signal_time,
+        entry_time=entry_time,
+        reason=signal["reason"],
+    )
+
+    if signal_id is None:
+        return
+
+    arrow = "🟢 CALL ⬆️" if signal["direction"] == "CALL" else "🔴 PUT ⬇️"
+
+    message = (
+        "━━━━━━━━━━━━━━━━━━\n"
+        "       🟦 STM PRO BOT 🟦\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"💱 Pair: {signal['asset']}\n"
+        f"📊 Direction: {arrow}\n"
+        f"⏱ Expiry: 1 Minute\n"
+        f"🎯 Entry Time: {format_time(entry_time)}\n"
+        f"💰 Payout: {signal['payout']:.0f}%\n"
+        f"🧠 Strategy: {signal['strategy']}\n"
+        f"⭐ Score: {signal['score']:.2f}\n\n"
+        f"📝 Reason: {signal['reason'] or 'Strategy conditions matched'}\n\n"
+        "⚠️ Signal only. Result is estimated from market candles; "
+        "it is not a broker-confirmed trade result.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "         STM PRO BOT\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    try:
+        await application.bot.send_message(
+            chat_id=TG_CHANNEL_ID,
+            text=message,
+        )
+        log.info("Signal published: %s %s", signal["asset"], signal["direction"])
+
+        asyncio.create_task(
+            resolve_signal(signal_id, signal, entry_time, application)
+        )
+
+    except Exception:
+        log.exception("Could not publish signal")
 
 
-async def candle_result(asset, direction, entry_time):
-    """
-    Candle-proxy result only. This is not the user's actual entry price
-    and is not confirmed Quotex settlement.
-    """
-    candles = await QUOTEX.candles(asset, 180, 60)
-    lookup = {c["time"]: c for c in candles}
-    candle = lookup.get(entry_time)
-    if not candle:
-        return None
+# ============================================================
+# RESULT CHECKING
+# ============================================================
 
-    o, c = candle["open"], candle["close"]
-    if abs(o - c) < 1e-12:
+def determine_candle_result(direction, candle):
+    op = float(candle["open"])
+    cl = float(candle["close"])
+
+    if cl == op:
         return "DRAW"
 
     if direction == "CALL":
-        return "WIN" if c > o else "LOSS"
-    return "WIN" if c < o else "LOSS"
+        return "WIN" if cl > op else "LOSS"
+
+    return "WIN" if cl < op else "LOSS"
 
 
-async def resolve_signal(context, signal_id, asset, direction, entry_time):
+async def find_candle(asset, target_time):
+    """
+    Fetch recent candles and find the candle whose timestamp
+    matches target_time. Retries because broker data can arrive late.
+    """
+    for _ in range(6):
+        candles = await get_candles(asset, 8)
+
+        for candle in candles:
+            if int(candle["time"]) == int(target_time):
+                return candle
+
+        await asyncio.sleep(2)
+
+    return None
+
+
+async def resolve_signal(signal_id, signal, entry_time, application):
+    """
+    Result is inferred from the 1-minute candle.
+    It is not a real account trade settlement because this bot
+    does not place trades and therefore has no broker order ID.
+    """
     try:
-        wait = max(0, entry_time + 62 - int(time.time()))
-        await asyncio.sleep(wait)
+        # Wait until the one-minute expiry has ended.
+        await asyncio.sleep(max(0, entry_time + 62 - time.time()))
 
-        initial = await candle_result(asset, direction, entry_time)
-        if initial is None:
-            update_result(signal_id, "PENDING", "Initial candle unavailable")
-            final = "PENDING"
-            detail = "Initial candle unavailable; not verified"
-        elif initial == "LOSS":
-            # MTG1 is modeled as the next candle in the same direction.
-            await asyncio.sleep(max(0, entry_time + 122 - int(time.time())))
-            mtg = await candle_result(asset, direction, entry_time + 60)
-            if mtg is None:
-                final = "PENDING"
-                detail = "Initial LOSS; MTG1 candle unavailable"
-            else:
-                final = "WIN" if mtg == "WIN" else (
-                    "DRAW" if mtg == "DRAW" else "LOSS"
-                )
-                detail = f"Initial {initial}; MTG1 proxy {mtg}"
-        else:
-            final = initial
-            detail = "Initial 1-minute candle proxy"
+        candle = await find_candle(signal["asset"], entry_time)
 
-        update_result(signal_id, final, detail)
-        await publish(
-            context,
-            "📊 STM PRO BOT RESULT\n"
-            f"Pair: {asset}\nDirection: {direction}\n"
-            f"Result: {final}\nDetails: {detail}\n"
-            "⚠️ Candle proxy only; not confirmed broker settlement."
+        if candle is None:
+            update_result(
+                signal_id,
+                "UNKNOWN",
+                "CANDLE_DATA_UNAVAILABLE",
+            )
+            await application.bot.send_message(
+                chat_id=TG_CHANNEL_ID,
+                text=(
+                    f"⚠️ RESULT UNAVAILABLE\n"
+                    f"Pair: {signal['asset']}\n"
+                    "Expiry candle could not be verified."
+                ),
+            )
+            return
+
+        result = determine_candle_result(
+            signal["direction"],
+            candle,
         )
-    except Exception:
-        log.exception("Result check failed for %s", asset)
-        update_result(signal_id, "PENDING", "Result check error")
 
+        mtg1_result = "NOT_USED"
 
-async def scanner_loop(context, user_id):
-    global SCANNER_RUNNING
-
-    try:
-        while SCANNER_RUNNING:
-            state = STATE.get(user_id, {})
-            pairs = list(state.get("selected_pairs", []))
-            strategy = state.get("strategy", "all")
-
-            if not pairs:
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
-
-            results = await asyncio.gather(
-                *(analyze_asset(asset, strategy) for asset in pairs),
-                return_exceptions=True
+        # MTG1: if first candle loses, evaluate the next candle
+        # in the same direction. This is still only an estimate.
+        if result == "LOSS":
+            next_candle = await find_candle(
+                signal["asset"],
+                entry_time + 60,
             )
 
-            # Queue each qualifying signal for the next available minute.
-            now = int(time.time())
-            publish_at = (now // 60 + 1) * 60 - 5
-            entry_time = publish_at + 5
-
-            # If the signal time has already passed, target the next minute.
-            if publish_at <= now:
-                publish_at += 60
-                entry_time += 60
-
-            delay = publish_at - int(time.time())
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-            if not SCANNER_RUNNING:
-                break
-
-            for result in results:
-                if not isinstance(result, dict):
-                    continue
-
-                item = result
-                signal_id = save_signal(item, entry_time, strategy)
-                if signal_id is None:
-                    continue
-
-                direction_text = (
-                    "🟢 CALL / UP" if item["direction"] == "CALL"
-                    else "🔴 PUT / DOWN"
+            if next_candle is None:
+                mtg1_result = "UNKNOWN"
+            else:
+                mtg1_result = determine_candle_result(
+                    signal["direction"],
+                    next_candle,
                 )
 
-                message = (
-                    "🟦 STM PRO BOT\n"
-                    f"Pair: {item['asset']}\n"
-                    f"Direction: {direction_text}\n"
-                    f"Entry: {time_text(entry_time)} ({TIMEZONE})\n"
-                    "Expiry: 1 minute\n"
-                    f"Payout: {item['payout']:.0f}%\n"
-                    f"Strategy: {strategy.upper()}\n"
-                    f"Score: {item['score']:.1f}\n"
-                    f"Setup: {item['reason']}\n"
-                    "MTG: 1 (manual only)\n"
-                    "⚠️ Signal only. Result is estimated from candles."
-                )
+        update_result(
+            signal_id,
+            result,
+            "CANDLE_ESTIMATE",
+            mtg1_result,
+        )
 
-                try:
-                    await publish(context, message)
-                    asyncio.create_task(
-                        resolve_signal(
-                            context, signal_id, item["asset"],
-                            item["direction"], entry_time
+        if result == "WIN":
+            result_text = "✅ WIN"
+        elif result == "LOSS":
+            result_text = "❌ LOSS"
+        else:
+            result_text = "➖ DRAW"
+
+        if mtg1_result == "WIN":
+            mtg_text = "✅ MTG1 WIN (estimated)"
+        elif mtg1_result == "LOSS":
+            mtg_text = "❌ MTG1 LOSS (estimated)"
+        elif mtg1_result == "UNKNOWN":
+            mtg_text = "⚠️ MTG1 result unavailable"
+        else:
+            mtg_text = "Not used"
+
+        await application.bot.send_message(
+            chat_id=TG_CHANNEL_ID,
+            text=(
+                "━━━━━━━━━━━━━━━━━━\n"
+                "      📊 STM PRO RESULT\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                f"💱 Pair: {signal['asset']}\n"
+                f"📈 Direction: {signal['direction']}\n"
+                f"🏁 Result: {result_text}\n"
+                f"🔁 MTG1: {mtg_text}\n\n"
+                "ℹ️ Result source: Quotex candle estimate.\n"
+                "This is not verified against an actual broker order.\n"
+                "━━━━━━━━━━━━━━━━━━"
+            ),
+        )
+
+    except Exception:
+        log.exception("Result resolution failed for signal %s", signal_id)
+        update_result(
+            signal_id,
+            "UNKNOWN",
+            "RESULT_CHECK_ERROR",
+        )
+
+
+# ============================================================
+# SCANNING LOOP
+# ============================================================
+
+async def scanning_loop(application):
+    log.info("Scanning loop started")
+
+    try:
+        while STATE["running"]:
+            started = time.time()
+
+            if not await connect_quotex():
+                await asyncio.sleep(10)
+                continue
+
+            assets = STATE["assets"][:]
+
+            if not assets:
+                await asyncio.sleep(2)
+                continue
+
+            tasks = [
+                analyze_asset(asset)
+                for asset in assets
+            ]
+
+            outcomes = await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
+
+            signals = []
+
+            for item in outcomes:
+                if isinstance(item, Exception):
+                    log.warning("Asset scan error: %s", item)
+                elif item:
+                    signals.append(item)
+
+            if signals and STATE["running"]:
+                # Reserve enough time for the signal to be sent.
+                entry_time = next_minute_timestamp()
+
+                # If scanning already took too long, skip this cycle.
+                if entry_time - time.time() <= 2:
+                    entry_time += 60
+
+                publish_time = entry_time - SIGNAL_LEAD_SECONDS
+                delay = publish_time - time.time()
+
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                # Re-check after waiting; never send expired signals.
+                if STATE["running"] and time.time() < entry_time - 1:
+                    for signal in signals:
+                        await publish_signal(
+                            application,
+                            signal,
+                            entry_time,
                         )
-                    )
-                except Exception:
-                    log.exception("Could not publish signal")
 
-            await asyncio.sleep(SCAN_INTERVAL)
+            elapsed = time.time() - started
+            await asyncio.sleep(
+                max(0.5, SCAN_INTERVAL_SECONDS - elapsed)
+            )
 
     except asyncio.CancelledError:
+        log.info("Scanning loop cancelled")
         raise
     except Exception:
-        log.exception("Scanner crashed")
+        log.exception("Scanning loop crashed")
     finally:
-        SCANNER_RUNNING = False
+        log.info("Scanning loop stopped")
 
 
-async def start_scanner(application, user_id):
-    global SCANNER_TASK, SCANNER_RUNNING
-
-    if SCANNER_RUNNING:
-        return
-
-    if not QUOTEX or not QUOTEX.client:
-        raise RuntimeError("Quotex data connector is not connected")
-
-    SCANNER_RUNNING = True
-    SCANNER_TASK = asyncio.create_task(
-        scanner_loop(application, user_id)
-    )
-
-
-async def startscan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    state = STATE.get(uid)
-
-    if not state or not state.get("selected_pairs"):
-        await update.effective_message.reply_text(
-            "First use /start and select category and pairs."
-        )
-        return
-
-    try:
-        await start_scanner(context.application, uid)
-        await update.effective_message.reply_text("Scanner started.")
-    except Exception as exc:
-        await update.effective_message.reply_text(f"Cannot start: {exc}")
-
-
-async def stopscan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global SCANNER_RUNNING, SCANNER_TASK
-    SCANNER_RUNNING = False
-
-    if SCANNER_TASK and not SCANNER_TASK.done():
-        SCANNER_TASK.cancel()
-        try:
-            await SCANNER_TASK
-        except asyncio.CancelledError:
-            pass
-
-    SCANNER_TASK = None
-    await update.effective_message.reply_text("Scanner stopped.")
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        f"Scanner: {'RUNNING' if SCANNER_RUNNING else 'STOPPED'}"
-    )
-
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT result, COUNT(*) n FROM signals GROUP BY result"
-        ).fetchall()
-
-    stats = {row["result"]: row["n"] for row in rows}
-    await update.effective_message.reply_text(
-        "📊 STM PRO BOT HISTORY\n"
-        f"Total: {sum(stats.values())}\n"
-        f"WIN: {stats.get('WIN', 0)}\n"
-        f"LOSS: {stats.get('LOSS', 0)}\n"
-        f"DRAW: {stats.get('DRAW', 0)}\n"
-        f"PENDING: {stats.get('PENDING', 0)}\n"
-        "Results are candle proxies, not broker-confirmed outcomes."
-    )
-
+# ============================================================
+# APP START / STOP
+# ============================================================
 
 async def post_init(application):
-    global QUOTEX
     init_db()
-    QUOTEX = QuotexFeed()
-    try:
-        await QUOTEX.connect()
-        log.info("Quotex connector connected")
-    except Exception:
-        log.exception("Quotex connection failed")
-        # Bot can still open menus, but scanner cannot run.
+    log.info("STM PRO BOT initialized")
 
 
 async def post_shutdown(application):
-    global SCANNER_RUNNING
-    SCANNER_RUNNING = False
-    if QUOTEX:
-        await QUOTEX.close()
+    STATE["running"] = False
+    await close_quotex()
 
 
 def main():
-    if not TOKEN:
-        raise SystemExit("Set TG_BOT_TOKEN in your .env file.")
+    if not TG_TOKEN:
+        raise RuntimeError("TG_BOT_TOKEN is missing from .env")
 
-    app = (
+    init_db()
+
+    application = (
         Application.builder()
-        .token(TOKEN)
+        .token(TG_TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("startscan", startscan_cmd))
-    app.add_handler(CommandHandler("stopscan", stopscan_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CallbackQueryHandler(callbacks))
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    log.info("STM PRO BOT starting")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("STM PRO BOT starting...")
+    application.run_polling()
 
 
 if __name__ == "__main__":
