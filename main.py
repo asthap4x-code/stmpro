@@ -1,3 +1,4 @@
+Python
 import asyncio
 import logging
 import os
@@ -864,3 +865,149 @@ async def scanner_loop(context):
                         f"⭐ Score: {score:.2f}\n"
                         f"🕒 Time: {local_time}\n"
                         f"🧠 Strategy: {reason}\n"
+                        "━━━━━━━━━━━━━━\n"
+                        "⚠️ Signal only. Profit is not guaranteed."
+                    )
+
+                    # Send to the current user's chat.
+                    if SCANNER_CHAT_ID:
+                        await send_text(context, SCANNER_CHAT_ID, message)
+
+                    # Optional channel posting. This is NOT a join requirement.
+                    if TG_CHANNEL_ID and TG_CHANNEL_ID != str(SCANNER_CHAT_ID):
+                        await send_text(context, TG_CHANNEL_ID, message)
+
+                    asyncio.create_task(
+                        evaluate_signal(
+                            context, signal_id, pair, asset,
+                            candles[-1], signal,
+                        )
+                    )
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Scan failed for %s", pair)
+
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        log.exception("Scanner stopped because of an error")
+    finally:
+        SCANNER_RUNNING = False
+
+
+async def evaluate_signal(context, signal_id, pair, asset, entry_candle, signal):
+    """Estimates a result from subsequent candle data; not broker-confirmed."""
+    try:
+        entry_time = entry_candle["time"]
+        # Wait until the next one-minute candle should have closed.
+        target = entry_time + 120
+        while time.time() < target:
+            await asyncio.sleep(3)
+
+        candles = await candles_for(asset, 5)
+        later = [c for c in candles if c["time"] > entry_time]
+
+        if not later:
+            log.warning("No result candle available for %s", pair)
+            return
+
+        close = later[0]["close"]
+        entry = entry_candle["close"]
+
+        if close == entry:
+            result = "DRAW"
+        elif signal == "CALL" and close > entry:
+            result = "WIN"
+        elif signal == "PUT" and close < entry:
+            result = "WIN"
+        else:
+            result = "LOSS"
+
+        update_result(signal_id, result)
+
+        if result == "LOSS":
+            LOSS_STREAK[pair] = LOSS_STREAK.get(pair, 0) + 1
+
+            if LOSS_STREAK[pair] >= 2:
+                PAUSE_NEXT.add(pair)
+                LOSS_STREAK[pair] = 0
+
+            if MTG_ENABLED and SCANNER_CHAT_ID:
+                await send_text(
+                    context, SCANNER_CHAT_ID,
+                    "♻️ STM PRO BOT MTG alert\n"
+                    f"Pair: {pair}\nPrevious estimated result: LOSS\n"
+                    "Wait for a fresh setup. No automatic trade is placed.",
+                )
+
+        elif result == "WIN":
+            LOSS_STREAK[pair] = 0
+
+        if SCANNER_CHAT_ID:
+            icon = {"WIN": "✅", "LOSS": "❌", "DRAW": "➖"}[result]
+            await send_text(
+                context, SCANNER_CHAT_ID,
+                f"{icon} STM PRO BOT estimated result\n"
+                f"Pair: {pair}\nSignal: {signal}\nResult: {result}",
+            )
+
+    except Exception:
+        log.exception("Could not estimate result for %s", pair)
+
+
+# =========================================================
+# STARTUP / SHUTDOWN
+# =========================================================
+
+async def post_init(application: Application):
+    log.info("STM PRO BOT started; channel join gate is disabled.")
+
+
+async def post_shutdown(application: Application):
+    global SCANNER_RUNNING
+    SCANNER_RUNNING = False
+
+    if QUOTEX is not None:
+        try:
+            await maybe_await(QUOTEX.close())
+        except Exception:
+            log.warning("Quotex close failed", exc_info=True)
+
+
+def main():
+    if not TG_BOT_TOKEN:
+        raise RuntimeError(
+            "TG_BOT_TOKEN missing. Check .env format, e.g. "
+            "TG_BOT_TOKEN='YOUR_REAL_TELEGRAM_TOKEN'"
+        )
+
+    init_db()
+
+    app = (
+        Application.builder()
+        .token(TG_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("markets", markets_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("mtg", mtg_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("startscan", startscan_cmd))
+    app.add_handler(CommandHandler("stopscan", stopscan_cmd))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    log.info("Starting STM PRO BOT")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
