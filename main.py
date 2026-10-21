@@ -18,16 +18,15 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Optional Quotex API
 try:
     from pyquotex.stable_api import Quotex
 except ImportError:
     Quotex = None
 
 
-# =========================
-# CONFIGURATION
-# =========================
+# =========================================================
+# STM PRO BOT - SINGLE FILE CONFIGURATION
+# =========================================================
 
 load_dotenv()
 
@@ -38,22 +37,23 @@ QUOTEX_EMAIL = os.getenv("QUOTEX_EMAIL", "").strip()
 QUOTEX_PASSWORD = os.getenv("QUOTEX_PASSWORD", "").strip()
 
 MIN_PAYOUT = float(os.getenv("MIN_PAYOUT", "80"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "10"))
-CANDLE_COUNT = 60
-EXPIRY_SECONDS = 60
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
+DATABASE = "stm_history.db"
 
-DB_FILE = "stm_history.db"
+TIMEFRAME = 60
+EXPIRY_SECONDS = 60
+SIGNAL_LEAD_SECONDS = 7
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logger = logging.getLogger("STM_PRO_BOT")
+log = logging.getLogger("STM_PRO_BOT")
 
 
-# =========================
-# MARKETS
-# =========================
+# =========================================================
+# MARKET PAIRS
+# =========================================================
 
 MARKETS = {
     "forex": {
@@ -65,6 +65,14 @@ MARKETS = {
         "USDCHF": "USD/CHF",
         "NZDUSD": "NZD/USD",
         "EURGBP": "EUR/GBP",
+        "EURJPY": "EUR/JPY",
+        "GBPJPY": "GBP/JPY",
+        "EURAUD": "EUR/AUD",
+        "GBPAUD": "GBP/AUD",
+        "EURCHF": "EUR/CHF",
+        "GBPCHF": "GBP/CHF",
+        "AUDJPY": "AUD/JPY",
+        "CADJPY": "CAD/JPY",
     },
     "commodities": {
         "XAUUSD_otc": "Gold OTC",
@@ -80,77 +88,174 @@ MARKETS = {
         "USDJPY_otc": "USD/JPY OTC",
         "AUDUSD_otc": "AUD/USD OTC",
         "USDCAD_otc": "USD/CAD OTC",
+        "USDCHF_otc": "USD/CHF OTC",
+        "NZDUSD_otc": "NZD/USD OTC",
+        "EURGBP_otc": "EUR/GBP OTC",
+        "EURJPY_otc": "EUR/JPY OTC",
+        "GBPJPY_otc": "GBP/JPY OTC",
     },
 }
 
 
-# =========================
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
+
+def db():
+    return sqlite3.connect(DATABASE)
+
 
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
+    with db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                user_id INTEGER,
+                user_id INTEGER NOT NULL,
                 pair TEXT NOT NULL,
                 direction TEXT NOT NULL,
-                payout REAL,
-                confidence REAL,
-                result TEXT DEFAULT 'PENDING'
+                payout REAL NOT NULL,
+                entry_price REAL,
+                exit_price REAL,
+                entry_time INTEGER NOT NULL,
+                expiry INTEGER NOT NULL,
+                result TEXT DEFAULT 'PENDING',
+                mtg INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
             )
         """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER PRIMARY KEY,
+                mtg_enabled INTEGER DEFAULT 0,
+                bot_enabled INTEGER DEFAULT 1
+            )
+        """)
+
         conn.commit()
 
 
-def save_signal(user_id, pair, direction, payout, confidence):
-    created_at = datetime.now(timezone.utc).isoformat()
+def user_settings(user_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT mtg_enabled, bot_enabled FROM settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
 
-    with sqlite3.connect(DB_FILE) as conn:
+        if not row:
+            conn.execute(
+                "INSERT OR IGNORE INTO settings(user_id) VALUES(?)",
+                (user_id,),
+            )
+            conn.commit()
+            return {"mtg": False, "enabled": True}
+
+        return {"mtg": bool(row[0]), "enabled": bool(row[1])}
+
+
+def set_setting(user_id, field, value):
+    if field not in ("mtg_enabled", "bot_enabled"):
+        return
+
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(user_id) VALUES(?)",
+            (user_id,),
+        )
+        conn.execute(
+            f"UPDATE settings SET {field}=? WHERE user_id=?",
+            (int(bool(value)), user_id),
+        )
+        conn.commit()
+
+
+def save_signal(
+    user_id,
+    pair,
+    direction,
+    payout,
+    entry_price,
+    entry_time,
+    mtg=False,
+):
+    with db() as conn:
         cursor = conn.execute("""
-            INSERT INTO signals
-            (created_at, user_id, pair, direction, payout, confidence)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO signals (
+                user_id, pair, direction, payout,
+                entry_price, entry_time, expiry,
+                result, mtg, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
         """, (
-            created_at,
             user_id,
             pair,
             direction,
             payout,
-            confidence,
+            entry_price,
+            entry_time,
+            EXPIRY_SECONDS,
+            int(mtg),
+            datetime.now(timezone.utc).isoformat(),
         ))
         conn.commit()
         return cursor.lastrowid
 
 
-def get_history(user_id, limit=10):
-    with sqlite3.connect(DB_FILE) as conn:
+def pending_signals():
+    with db() as conn:
         return conn.execute("""
-            SELECT created_at, pair, direction, payout,
-                   confidence, result
+            SELECT id, user_id, pair, direction, entry_price,
+                   entry_time, expiry, mtg
             FROM signals
-            WHERE user_id = ?
+            WHERE result='PENDING'
+        """).fetchall()
+
+
+def close_signal(signal_id, exit_price, result):
+    with db() as conn:
+        conn.execute("""
+            UPDATE signals
+            SET exit_price=?, result=?
+            WHERE id=?
+        """, (exit_price, result, signal_id))
+        conn.commit()
+
+
+def user_history(user_id, limit=10):
+    with db() as conn:
+        return conn.execute("""
+            SELECT pair, direction, payout, entry_price,
+                   exit_price, result, mtg, created_at
+            FROM signals
+            WHERE user_id=?
             ORDER BY id DESC
             LIMIT ?
         """, (user_id, limit)).fetchall()
 
 
-def update_result(signal_id, result):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(
-            "UPDATE signals SET result = ? WHERE id = ?",
-            (result, signal_id),
-        )
-        conn.commit()
+def consecutive_losses(user_id):
+    rows = user_history(user_id, 20)
+    count = 0
+
+    for row in rows:
+        result = row[5]
+
+        if result == "PENDING":
+            continue
+
+        if result == "LOSS":
+            count += 1
+        elif result == "WIN":
+            break
+
+    return count
 
 
-# =========================
+# =========================================================
 # QUOTEX CONNECTION
-# =========================
+# =========================================================
 
-class QuotexEngine:
+class MarketAPI:
     def __init__(self):
         self.client = None
         self.connected = False
@@ -159,13 +264,12 @@ class QuotexEngine:
     async def connect(self):
         if Quotex is None:
             raise RuntimeError(
-                "pyquotex is not installed. Install your compatible "
-                "PyQuotex package first."
+                "PyQuotex is not installed. Check your installed package."
             )
 
         if not QUOTEX_EMAIL or not QUOTEX_PASSWORD:
             raise RuntimeError(
-                "Set QUOTEX_EMAIL and QUOTEX_PASSWORD in your .env file."
+                "QUOTEX_EMAIL and QUOTEX_PASSWORD are missing from .env."
             )
 
         self.client = Quotex(
@@ -182,66 +286,49 @@ class QuotexEngine:
             self.connected = bool(result)
 
         if not self.connected:
-            raise RuntimeError(
-                "Quotex connection failed. Check login and API compatibility."
-            )
+            raise RuntimeError("Quotex connection failed.")
 
-        logger.info("Quotex connection established.")
-        return True
+        log.info("Quotex connected.")
 
-    async def ensure_connected(self):
+    async def ensure(self):
         if self.client is None or not self.connected:
             await self.connect()
 
-    async def get_candles(self, pair):
-        await self.ensure_connected()
+    async def candles(self, pair, count=80):
+        await self.ensure()
 
-        candles = await self.client.get_candles(
+        raw = await self.client.get_candles(
             pair,
-            60,
+            TIMEFRAME,
             int(time.time()),
-            CANDLE_COUNT * 60,
+            count * TIMEFRAME,
         )
 
-        if not candles or not isinstance(candles, (list, tuple)):
-            return []
+        result = []
 
-        cleaned = []
+        if not isinstance(raw, (list, tuple)):
+            return result
 
-        for candle in candles:
-            if not isinstance(candle, dict):
+        for item in raw:
+            if not isinstance(item, dict):
                 continue
 
             try:
-                open_price = float(candle["open"])
-                close_price = float(candle["close"])
-                high_price = float(candle.get("high", max(
-                    open_price, close_price
-                )))
-                low_price = float(candle.get("low", min(
-                    open_price, close_price
-                )))
-
-                cleaned.append({
-                    "open": open_price,
-                    "close": close_price,
-                    "high": high_price,
-                    "low": low_price,
-                    "time": candle.get("time", 0),
+                result.append({
+                    "time": int(item.get("time", 0)),
+                    "open": float(item["open"]),
+                    "close": float(item["close"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
                 })
-            except (KeyError, TypeError, ValueError):
+            except (ValueError, TypeError, KeyError):
                 continue
 
-        cleaned.sort(key=lambda item: item["time"])
-        return cleaned
+        result.sort(key=lambda candle: candle["time"])
+        return result
 
-    async def get_payout(self, pair):
-        """
-        PyQuotex versions differ in payout methods and return formats.
-        If this installed version exposes get_payment(), read its result.
-        Return None if payout cannot be verified.
-        """
-        await self.ensure_connected()
+    async def payout(self, pair):
+        await self.ensure()
 
         method = getattr(self.client, "get_payment", None)
 
@@ -270,7 +357,6 @@ class QuotexEngine:
 
             value = float(value)
 
-            # Some API versions report 0.80 instead of 80.
             if 0 < value <= 1:
                 value *= 100
 
@@ -280,84 +366,77 @@ class QuotexEngine:
             return value
 
         except Exception as exc:
-            logger.warning("Could not verify payout for %s: %s", pair, exc)
+            log.warning("Payout lookup failed for %s: %s", pair, exc)
             return None
 
 
-engine = QuotexEngine()
+market_api = MarketAPI()
 
 
-# =========================
-# STRATEGY
-# =========================
+# =========================================================
+# STRATEGY AND MARKET FILTERS
+# =========================================================
 
-def calculate_ema(values, period):
+def ema(values, period):
     if len(values) < period:
         return []
 
+    current = sum(values[:period]) / period
+    output = [None] * (period - 1) + [current]
     multiplier = 2 / (period + 1)
-    ema = sum(values[:period]) / period
-    result = [None] * (period - 1) + [ema]
 
     for value in values[period:]:
-        ema = (value - ema) * multiplier + ema
-        result.append(ema)
+        current = (value - current) * multiplier + current
+        output.append(current)
 
-    return result
+    return output
 
 
-def analyze_candles(candles):
-    """
-    Educational trend/momentum filter.
-    Returns None when data is insufficient or movement is too strong.
-    """
+def candle_direction(candle):
+    if candle["close"] > candle["open"]:
+        return "UP"
+    if candle["close"] < candle["open"]:
+        return "DOWN"
+    return "FLAT"
+
+
+def analyze_market(raw_candles):
+    # Exclude the currently forming candle.
+    if len(raw_candles) < 35:
+        return None
+
+    now = int(time.time())
+    current_candle_start = now - (now % TIMEFRAME)
+
+    candles = [
+        candle for candle in raw_candles
+        if candle["time"] < current_candle_start
+    ]
+
     if len(candles) < 30:
         return None
 
-    # Use only completed candles where possible.
-    candles = candles[:-1]
-
-    if len(candles) < 25:
-        return None
-
     closes = [c["close"] for c in candles]
-    opens = [c["open"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-
     if any(price <= 0 for price in closes):
         return None
 
-    ema_fast = calculate_ema(closes, 5)
-    ema_slow = calculate_ema(closes, 13)
+    fast = ema(closes, 5)
+    slow = ema(closes, 13)
 
-    if not ema_fast or not ema_slow:
-        return None
-
-    fast_now = ema_fast[-1]
-    slow_now = ema_slow[-1]
-
-    if fast_now is None or slow_now is None:
+    if not fast or not slow or fast[-1] is None or slow[-1] is None:
         return None
 
     recent = candles[-8:]
-    directions = []
+    directions = [candle_direction(c) for c in recent]
 
-    for candle in recent:
-        if candle["close"] > candle["open"]:
-            directions.append("UP")
-        elif candle["close"] < candle["open"]:
-            directions.append("DOWN")
-        else:
-            directions.append("FLAT")
-
-    # Avoid markets with 3 or more consecutive candles
-    # moving in the same direction.
+    # Avoid a market after 3 or more consecutive candles
+    # have closed in the same direction.
     streak = 1
-    for index in range(len(directions) - 1, 0, -1):
+
+    for i in range(len(directions) - 1, 0, -1):
         if (
-            directions[index] != "FLAT"
-            and directions[index] == directions[index - 1]
+            directions[i] != "FLAT"
+            and directions[i] == directions[i - 1]
         ):
             streak += 1
         else:
@@ -366,68 +445,63 @@ def analyze_candles(candles):
     if streak >= 3:
         return None
 
-    last = candles[-1]
-    price = closes[-1]
-
-    # Avoid unusually large recent candles.
-    avg_range = sum(
-        highs[i] - lows[i] for i in range(-11, -1)
-    ) / 10
-
-    last_range = last["high"] - last["low"]
-
-    if avg_range <= 0:
+    # Avoid unusually large candles and sharp movement.
+    ranges = [c["high"] - c["low"] for c in candles[-11:-1]]
+    if not ranges:
         return None
 
-    if last_range > avg_range * 2.2:
+    average_range = sum(ranges) / len(ranges)
+    last_range = candles[-1]["high"] - candles[-1]["low"]
+
+    if average_range <= 0 or last_range > average_range * 2.2:
         return None
 
-    # Reject extremely large short-term movement.
-    recent_move = abs(closes[-1] - closes[-6]) / price * 100
+    last_price = closes[-1]
+    move = abs(closes[-1] - closes[-6]) / last_price * 100
 
-    if recent_move > 0.35:
+    if move > 0.35:
         return None
 
-    bullish = fast_now > slow_now and closes[-1] > fast_now
-    bearish = fast_now < slow_now and closes[-1] < fast_now
+    bullish = fast[-1] > slow[-1] and closes[-1] > fast[-1]
+    bearish = fast[-1] < slow[-1] and closes[-1] < fast[-1]
 
-    if not bullish and not bearish:
+    if bullish and directions[-1] == "UP" and streak < 3:
+        direction = "CALL"
+    elif bearish and directions[-1] == "DOWN" and streak < 3:
+        direction = "PUT"
+    else:
         return None
 
-    direction = "CALL" if bullish else "PUT"
+    separation = abs(fast[-1] - slow[-1]) / last_price * 100
+    momentum = abs(closes[-1] - closes[-4]) / last_price * 100
 
-    # Do not chase a long one-direction streak.
-    if directions[-1] != "FLAT" and streak >= 2:
-        return None
-
-    # Basic scoring, not a probability of winning.
-    separation = abs(fast_now - slow_now) / price * 100
-    momentum = abs(closes[-1] - closes[-4]) / price * 100
-
-    score = 1.0
-    score += min(separation * 10, 0.7)
-    score += min(momentum * 2, 0.3)
-
-    confidence = min(95.0, 60.0 + score * 10)
+    score = 60 + min(separation * 10, 15) + min(momentum * 2, 10)
 
     return {
         "direction": direction,
-        "confidence": round(confidence, 1),
+        "score": round(min(score, 85), 1),
+        "price": last_price,
+        "candle_time": candles[-1]["time"],
     }
 
 
-# =========================
+# =========================================================
 # TELEGRAM KEYBOARDS
-# =========================
+# =========================================================
 
-def main_keyboard():
+def home_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Scan Markets", callback_data="scan_menu"),
+            InlineKeyboardButton("📡 Start Scanner", callback_data="scanner"),
+            InlineKeyboardButton("⏹ Stop Scanner", callback_data="stop"),
         ],
         [
-            InlineKeyboardButton("📈 Signal History", callback_data="history"),
-            InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+            InlineKeyboardButton("⚙ MTG Settings", callback_data="mtg"),
+            InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("📜 Signal History", callback_data="history"),
+            InlineKeyboardButton("ℹ Help", callback_data="help"),
         ],
     ])
 
@@ -446,13 +520,11 @@ def category_keyboard():
                 "Currency OTC", callback_data="cat:currency_otc"
             ),
         ],
-        [
-            InlineKeyboardButton("⬅️ Back", callback_data="home"),
-        ],
+        [InlineKeyboardButton("⬅ Back", callback_data="home")],
     ])
 
 
-def pair_keyboard(category):
+def pairs_keyboard(category):
     pairs = MARKETS.get(category, {})
     rows = []
     row = []
@@ -471,128 +543,266 @@ def pair_keyboard(category):
         rows.append(row)
 
     rows.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="scan_menu")
+        InlineKeyboardButton("⬅ Back", callback_data="scanner")
     ])
 
     return InlineKeyboardMarkup(rows)
 
 
-# =========================
-# SIGNAL SCANNING
-# =========================
+# =========================================================
+# SIGNAL DELIVERY
+# =========================================================
 
-async def scan_pair(pair):
-    async with engine.lock:
-        payout = await engine.get_payout(pair)
+async def send_to_channel(context, text):
+    if not TG_CHANNEL_ID:
+        return
 
-        # Never assume a payout when it cannot be verified.
-        if payout is None:
-            return {
-                "ok": False,
-                "reason": (
-                    "Payout could not be verified for this asset. "
-                    "Check your installed PyQuotex API version."
-                ),
-            }
-
-        if payout < MIN_PAYOUT:
-            return {
-                "ok": False,
-                "reason": f"Payout is {payout:.0f}%, below the {MIN_PAYOUT:.0f}% minimum.",
-            }
-
-        candles = await engine.get_candles(pair)
-
-    signal = analyze_candles(candles)
-
-    if signal is None:
-        return {
-            "ok": False,
-            "reason": "No valid setup. Market filters rejected this pair.",
-        }
-
-    return {
-        "ok": True,
-        "pair": pair,
-        "payout": payout,
-        **signal,
-    }
+    try:
+        await context.bot.send_message(
+            chat_id=TG_CHANNEL_ID,
+            text=text,
+        )
+    except Exception:
+        log.exception("Could not post signal to configured channel.")
 
 
-async def send_signal(update, context, pair, result):
-    user_id = update.effective_user.id
-
+async def publish_signal(
+    context,
+    user_id,
+    pair,
+    payout,
+    analysis,
+    mtg=False,
+):
+    entry_time = int(time.time())
     signal_id = save_signal(
         user_id=user_id,
         pair=pair,
-        direction=result["direction"],
-        payout=result["payout"],
-        confidence=result["confidence"],
+        direction=analysis["direction"],
+        payout=payout,
+        entry_price=analysis["price"],
+        entry_time=entry_time,
+        mtg=mtg,
     )
 
-    arrow = "🟢 CALL ⬆️" if result["direction"] == "CALL" else "🔴 PUT ⬇️"
+    direction = analysis["direction"]
+    arrow = "🟢 CALL ⬆️" if direction == "CALL" else "🔴 PUT ⬇️"
+    mtg_text = "\n⚠️ MARTINGALE STEP 1" if mtg else ""
 
     message = (
         "🚀 STM PRO BOT\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"💱 Asset: {pair}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 Pair: {pair}\n"
         f"📍 Direction: {arrow}\n"
-        f"⏱ Expiry: {EXPIRY_SECONDS} seconds\n"
-        f"💰 Payout: {result['payout']:.0f}%\n"
-        f"📊 Setup score: {result['confidence']:.1f}/100\n"
-        f"🆔 Signal ID: {signal_id}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Analytical signal only. No profit is guaranteed."
+        f"💰 Payout: {payout:.0f}%\n"
+        f"⏱ Expiry: 1 Minute\n"
+        f"🕒 Entry: {datetime.fromtimestamp(entry_time).strftime('%H:%M:%S')}\n"
+        f"💵 Entry Price: {analysis['price']}\n"
+        f"📊 Setup Score: {analysis['score']}/100\n"
+        f"🆔 Signal ID: {signal_id}"
+        f"{mtg_text}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "       STM PRO BOT\n"
+        "⚠️ Signals are not guaranteed wins."
     )
 
-    await update.effective_chat.send_message(message)
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=message,
+        )
+    except Exception:
+        log.exception("Failed to deliver signal to user %s", user_id)
 
-    if TG_CHANNEL_ID:
-        try:
+    await send_to_channel(context, message)
+
+
+# =========================================================
+# SCANNER
+# =========================================================
+
+async def scan_once(context, user_id, pair, mtg=False):
+    async with market_api.lock:
+        payout = await market_api.payout(pair)
+
+        if payout is None:
+            return "Payout could not be verified. No signal sent."
+
+        if payout < MIN_PAYOUT:
+            return f"Skipped: payout {payout:.0f}% is below {MIN_PAYOUT:.0f}%."
+
+        candles = await market_api.candles(pair)
+
+    analysis = analyze_market(candles)
+
+    if analysis is None:
+        return "No signal: market filters rejected this setup."
+
+    await publish_signal(
+        context=context,
+        user_id=user_id,
+        pair=pair,
+        payout=payout,
+        analysis=analysis,
+        mtg=mtg,
+    )
+
+    return "Signal sent."
+
+
+async def scanner_loop(context, user_id, pair):
+    while True:
+        settings = user_settings(user_id)
+
+        if not settings["enabled"]:
+            break
+
+        now = time.time()
+        next_minute = (int(now) // 60 + 1) * 60
+        target = next_minute - SIGNAL_LEAD_SECONDS
+
+        if target > now:
+            await asyncio.sleep(target - now)
+
+        settings = user_settings(user_id)
+        if not settings["enabled"]:
+            break
+
+        if consecutive_losses(user_id) >= 2:
             await context.bot.send_message(
-                chat_id=TG_CHANNEL_ID,
-                text=message,
+                chat_id=user_id,
+                text="Risk protection: two consecutive losses detected. "
+                     "The next signal has been skipped.",
             )
-        except Exception as exc:
-            logger.warning("Channel post failed: %s", exc)
+            await asyncio.sleep(60)
+            continue
+
+        try:
+            result = await scan_once(context, user_id, pair)
+            log.info("Scan result for %s: %s", pair, result)
+        except Exception:
+            log.exception("Scanner error for %s", pair)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="Scanner error. Check the Quotex connection and logs.",
+            )
+
+        await asyncio.sleep(60)
 
 
-# =========================
-# COMMANDS
-# =========================
+# =========================================================
+# RESULT CHECKER
+# =========================================================
+
+async def result_checker(app):
+    while True:
+        try:
+            now = int(time.time())
+
+            for row in pending_signals():
+                signal_id, user_id, pair, direction, entry_price, entry_time, expiry, mtg = row
+
+                if now < entry_time + expiry:
+                    continue
+
+                async with market_api.lock:
+                    candles = await market_api.candles(pair, 10)
+
+                if not candles:
+                    continue
+
+                # Find the candle at/after the signal's expiry.
+                target_time = entry_time + expiry
+                candidates = [
+                    candle for candle in candles
+                    if candle["time"] <= target_time
+                ]
+
+                if not candidates:
+                    continue
+
+                exit_price = candidates[-1]["close"]
+
+                if entry_price is None:
+                    result = "UNKNOWN"
+                elif exit_price == entry_price:
+                    result = "DRAW"
+                elif direction == "CALL":
+                    result = "WIN" if exit_price > entry_price else "LOSS"
+                else:
+                    result = "WIN" if exit_price < entry_price else "LOSS"
+
+                close_signal(signal_id, exit_price, result)
+
+                message = (
+                    "📋 STM PRO BOT — RESULT\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Pair: {pair}\n"
+                    f"Direction: {direction}\n"
+                    f"Opening Price: {entry_price}\n"
+                    f"Closing Price: {exit_price}\n"
+                    f"Result: {result}\n"
+                    "━━━━━━━━━━━━━━━━━━━━"
+                )
+
+                try:
+                    await app.bot.send_message(
+                        chat_id=user_id,
+                        text=message,
+                    )
+                except Exception:
+                    log.exception("Could not send result to user.")
+
+                await send_to_channel(
+                    type("Context", (), {"bot": app.bot})(),
+                    message,
+                )
+
+                # MTG is proposed only after a confirmed first-step loss.
+                settings = user_settings(user_id)
+
+                if result == "LOSS" and not mtg and settings["mtg"]:
+                    await app.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            "⚠️ First signal resulted in a loss.\n"
+                            "Prepare for MTG step 1 on the next candle.\n"
+                            "The next setup must pass all market filters."
+                        ),
+                    )
+
+        except Exception:
+            log.exception("Result checker error.")
+
+        await asyncio.sleep(3)
+
+
+# =========================================================
+# COMMAND HANDLERS
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
     await update.effective_message.reply_text(
-        "Welcome to STM PRO BOT!\n\n"
-        "Language: English 🇬🇧\n"
+        "Welcome to STM PRO BOT.\n\n"
+        "Language: English\n"
         f"Minimum payout: {MIN_PAYOUT:.0f}%\n"
-        "Expiry: 1 minute\n\n"
-        "Choose an option below.",
-        reply_markup=main_keyboard(),
+        "Expiry: 1 minute\n"
+        "Mode: Signal-only — no automatic trading.\n\n"
+        "Select an option:",
+        reply_markup=home_keyboard(),
     )
 
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Ask MTG preference at startup.
     await update.effective_message.reply_text(
-        "STM PRO BOT — Help\n\n"
-        "/start - Open the main menu\n"
-        "/scan - Choose a market and scan once\n"
-        "/history - View your recent signal history\n"
-        "/status - Check configuration\n\n"
-        "The bot filters out low payouts and some high-momentum "
-        "conditions. It does not guarantee winning trades."
-    )
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "STM PRO BOT Status\n\n"
-        f"Minimum payout: {MIN_PAYOUT:.0f}%\n"
-        f"Scan interval setting: {SCAN_INTERVAL} seconds\n"
-        f"PyQuotex package: {'Available' if Quotex else 'Not installed'}\n"
-        f"Quotex credentials: "
-        f"{'Configured' if QUOTEX_EMAIL and QUOTEX_PASSWORD else 'Missing'}\n"
-        f"Channel broadcasting: {'Enabled' if TG_CHANNEL_ID else 'Disabled'}"
+        "Enable Martingale (MTG) step 1?",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Yes", callback_data="mtg_yes"),
+                InlineKeyboardButton("No", callback_data="mtg_no"),
+            ]
+        ]),
     )
 
 
@@ -604,94 +814,149 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_history(update.effective_user.id)
+    rows = user_history(update.effective_user.id, 10)
 
     if not rows:
-        await update.effective_message.reply_text(
-            "You have no saved signals yet."
-        )
+        await update.effective_message.reply_text("No signal history yet.")
         return
 
-    lines = ["📈 STM PRO BOT — Recent Signal History\n"]
+    lines = ["📜 STM PRO BOT — SIGNAL HISTORY\n"]
 
     for row in rows:
-        created_at, pair, direction, payout, confidence, result = row
-        timestamp = created_at[:19].replace("T", " ")
-
+        pair, direction, payout, entry, exit_price, result, mtg, created = row
         lines.append(
-            f"{timestamp} UTC\n"
-            f"{pair} | {direction}\n"
-            f"Payout: {payout:.0f}% | Score: {confidence:.1f}/100\n"
-            f"Result: {result}\n"
+            f"{pair} | {direction} | {result}\n"
+            f"Payout: {payout:.0f}% | Entry: {entry} | Exit: {exit_price}\n"
+            f"MTG: {'Yes' if mtg else 'No'} | {created[:19]}\n"
         )
 
     await update.effective_message.reply_text("\n".join(lines))
 
 
-# =========================
-# CALLBACKS
-# =========================
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = user_history(update.effective_user.id, 1000)
+    closed = [row for row in rows if row[5] in ("WIN", "LOSS", "DRAW")]
 
-async def callback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+    wins = sum(1 for row in closed if row[5] == "WIN")
+    losses = sum(1 for row in closed if row[5] == "LOSS")
+    accuracy = (wins / len(closed) * 100) if closed else 0
+
+    await update.effective_message.reply_text(
+        "📊 STM PRO BOT STATISTICS\n\n"
+        f"Closed signals: {len(closed)}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Win rate: {accuracy:.1f}%\n\n"
+        "Historical results do not predict future outcomes."
+    )
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_setting(update.effective_user.id, "bot_enabled", False)
+    await update.effective_message.reply_text("Scanner stopped.")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "STM PRO BOT Help\n\n"
+        "/start - Main menu and MTG preference\n"
+        "/scan - Select a market and asset\n"
+        "/history - Recent signals\n"
+        "/stats - Signal statistics\n"
+        "/stop - Stop scanner\n\n"
+        "Signals are informational. No trade is executed automatically."
+    )
+
+
+# =========================================================
+# CALLBACK HANDLER
+# =========================================================
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    user_id = query.from_user.id
     data = query.data or ""
 
     if data == "home":
         await query.edit_message_text(
-            "STM PRO BOT\nChoose an option:",
-            reply_markup=main_keyboard(),
+            "STM PRO BOT — Main Menu",
+            reply_markup=home_keyboard(),
         )
         return
 
-    if data == "scan_menu":
+    if data == "scanner":
         await query.edit_message_text(
             "Choose a market category:",
             reply_markup=category_keyboard(),
         )
         return
 
-    if data == "help":
+    if data == "stop":
+        set_setting(user_id, "bot_enabled", False)
+        await query.edit_message_text("Scanner stopped.")
+        return
+
+    if data == "mtg":
         await query.edit_message_text(
-            "Commands:\n"
-            "/start - Main menu\n"
-            "/scan - Scan a selected market\n"
-            "/history - Recent signal history\n"
-            "/status - Bot configuration\n\n"
-            "Signals are analytical estimates, not guaranteed outcomes.",
-            reply_markup=main_keyboard(),
+            "Enable Martingale step 1?",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Yes", callback_data="mtg_yes"),
+                    InlineKeyboardButton("No", callback_data="mtg_no"),
+                ],
+                [InlineKeyboardButton("Back", callback_data="home")],
+            ]),
         )
         return
 
-    if data == "history":
-        rows = get_history(query.from_user.id)
+    if data == "mtg_yes":
+        set_setting(user_id, "mtg_enabled", True)
+        await query.edit_message_text("MTG enabled.")
+        return
 
+    if data == "mtg_no":
+        set_setting(user_id, "mtg_enabled", False)
+        await query.edit_message_text("MTG disabled.")
+        return
+
+    if data == "history":
+        rows = user_history(user_id, 10)
         if not rows:
-            await query.edit_message_text(
-                "You have no saved signals yet.",
-                reply_markup=main_keyboard(),
-            )
+            await query.edit_message_text("No signal history yet.")
             return
 
-        lines = ["📈 Recent Signal History\n"]
-
+        lines = ["📜 Recent Signal History\n"]
         for row in rows:
-            created_at, pair, direction, payout, confidence, result = row
+            pair, direction, payout, entry, exit_price, result, mtg, created = row
             lines.append(
-                f"{created_at[:19].replace('T', ' ')} UTC\n"
-                f"{pair} | {direction} | {payout:.0f}% payout\n"
-                f"Score: {confidence:.1f}/100 | {result}\n"
+                f"{pair} | {direction} | {result}\n"
+                f"Payout {payout:.0f}% | Entry {entry} | Exit {exit_price}"
             )
 
+        await query.edit_message_text("\n\n".join(lines))
+        return
+
+    if data == "stats":
+        rows = user_history(user_id, 1000)
+        closed = [r for r in rows if r[5] in ("WIN", "LOSS", "DRAW")]
+        wins = sum(1 for r in closed if r[5] == "WIN")
+        losses = sum(1 for r in closed if r[5] == "LOSS")
+        rate = wins / len(closed) * 100 if closed else 0
+
         await query.edit_message_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Back", callback_data="home")
-            ]]),
+            f"Closed signals: {len(closed)}\n"
+            f"Wins: {wins}\nLosses: {losses}\nWin rate: {rate:.1f}%"
+        )
+        return
+
+    if data == "help":
+        await query.edit_message_text(
+            "Use /scan to select a market.\n"
+            "Use /history to review signals.\n"
+            "Use /stats to review closed results.\n"
+            "Use /stop to stop the scanner."
         )
         return
 
@@ -703,16 +968,15 @@ async def callback_handler(
             return
 
         await query.edit_message_text(
-            "Choose an asset:",
-            reply_markup=pair_keyboard(category),
+            "Select an asset:",
+            reply_markup=pairs_keyboard(category),
         )
         return
 
     if data.startswith("pair:"):
         parts = data.split(":", 2)
-
         if len(parts) != 3:
-            await query.edit_message_text("Invalid asset selection.")
+            await query.edit_message_text("Invalid asset.")
             return
 
         category, pair = parts[1], parts[2]
@@ -721,72 +985,55 @@ async def callback_handler(
             await query.edit_message_text("Unknown asset.")
             return
 
+        set_setting(user_id, "bot_enabled", True)
+
         await query.edit_message_text(
-            f"Scanning {pair}...\nPlease wait."
+            f"Scanning {pair}. Please wait..."
         )
 
         try:
-            result = await scan_pair(pair)
-
-            if not result["ok"]:
-                await query.message.reply_text(
-                    f"⏸ No signal for {pair}\n\n"
-                    f"Reason: {result['reason']}",
-                    reply_markup=main_keyboard(),
-                )
-                return
-
-            await send_signal(update, context, pair, result)
-
+            result = await scan_once(context, user_id, pair)
+            await query.message.reply_text(result)
         except Exception as exc:
-            logger.exception("Scan failed for %s", pair)
+            log.exception("Manual scan failed.")
             await query.message.reply_text(
-                "❌ Scan failed.\n"
-                "Check your Quotex connection, asset name, and installed "
-                "PyQuotex API compatibility.\n\n"
-                f"Error: {str(exc)[:250]}",
-                reply_markup=main_keyboard(),
+                "Scan failed. Check Quotex API compatibility.\n"
+                f"Error: {str(exc)[:200]}"
             )
 
 
-# =========================
-# ERROR HANDLER
-# =========================
+# =========================================================
+# APP STARTUP
+# =========================================================
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logger.error("Telegram update error: %s", context.error)
+async def post_init(app):
+    app.create_task(result_checker(app))
 
-
-# =========================
-# MAIN
-# =========================
 
 def main():
     if not TG_TOKEN:
         raise RuntimeError(
-            "TG_BOT_TOKEN is missing. Set it in your .env file."
+            "TG_BOT_TOKEN is missing. Check your .env file."
         )
 
     init_db()
 
-    application = Application.builder().token(TG_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("scan", scan_command))
-    application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("status", status_command))
-
-    application.add_handler(
-        CallbackQueryHandler(callback_handler)
+    application = (
+        Application.builder()
+        .token(TG_TOKEN)
+        .post_init(post_init)
+        .build()
     )
 
-    application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(callback_handler))
 
-    logger.info("STM PRO BOT starting in English mode...")
+    log.info("STM PRO BOT started in English mode.")
     application.run_polling(drop_pending_updates=True)
 
 
