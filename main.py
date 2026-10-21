@@ -63,7 +63,11 @@ log = logging.getLogger("STM_PRO_BOT")
 try:
     TZ = ZoneInfo(BOT_TIMEZONE)
 except Exception:
-    TZ = ZoneInfo("UTC")
+    try:
+        TZ = ZoneInfo("Asia/Male")
+    except Exception:
+        from datetime import timezone
+        TZ = timezone.utc
 
 
 # ============================================================
